@@ -280,6 +280,11 @@ end
 
 local TitleParser = {}
 
+function TitleParser.max_release_year()
+    local cur_year = tonumber(os.date("%Y")) or 2026
+    return cur_year + 1
+end
+
 local SPECIAL_TERMS = {
     "rifftrax", "commentary", "reaction", "re edit", "re-edit",
     "behind the scenes", "featurette", "making of", "interview",
@@ -433,10 +438,38 @@ function TitleParser.parse_season_episode(str)
     end
 
     if s_title and #s_title > 1 and s and e then
-        return TitleParser.clean_title(s_title), tonumber(s), tonumber(e), season_missing
+        local max_year = TitleParser.max_release_year()
+        local parsed_year = nil
+        local raw_title = s_title
+        local y_str = s_title:match("[%._%-%s%(%[]+(%d%d%d%d)[%._%-%s%)%]]*$")
+        local y_num = tonumber(y_str)
+        if y_num and y_num >= 1900 and y_num <= max_year then
+            local base = s_title:match("^(.-)[%._%-%s%(%[]+" .. y_str .. "[%._%-%s%)%]]*$")
+            if base and base:match("%w") then
+                s_title = base
+                parsed_year = y_num
+            end
+        end
+
+        local cleaned_title = TitleParser.clean_title(s_title)
+
+        if not parsed_year and cleaned_title and #cleaned_title > 0 then
+            local cy_str = cleaned_title:match("%s+(%d%d%d%d)%s*$")
+            local cy_num = tonumber(cy_str)
+            if cy_num and cy_num >= 1900 and cy_num <= max_year then
+                local c_base = cleaned_title:match("^(.-)%s+" .. cy_str .. "%s*$")
+                if c_base and c_base:match("%w") then
+                    cleaned_title = c_base
+                    parsed_year = cy_num
+                end
+            end
+        end
+
+        local title_with_year = TitleParser.clean_title(raw_title)
+        return cleaned_title, tonumber(s), tonumber(e), season_missing, parsed_year, title_with_year
     end
 
-    return nil, nil, nil, false
+    return nil, nil, nil, false, nil, nil
 end
 
 function TitleParser.canonical_title(str)
@@ -484,7 +517,9 @@ function TitleParser.validate_series_seasons(meta_videos, media_info)
         season_count = season_count + 1
     end
 
-
+    if season_count > 1 then
+        return false, season_count
+    end
 
     media_info.season = 1
     media_info.season_missing = false
@@ -631,8 +666,16 @@ function TitleParser.score_movie_candidate(candidate, query_title, target_year, 
     return score
 end
 
-function TitleParser.score_series_candidate(candidate, query_title, all_candidates)
+function TitleParser.score_series_candidate(candidate, query_title, target_year_or_candidates, all_candidates)
     if not candidate or not candidate.name then return -99999 end
+
+    local target_year = nil
+    if type(target_year_or_candidates) == "number" then
+        target_year = target_year_or_candidates
+    elseif type(target_year_or_candidates) == "table" and not all_candidates then
+        all_candidates = target_year_or_candidates
+    end
+
     local q_canon = TitleParser.canonical_title(query_title)
     local c_canon = TitleParser.canonical_title(candidate.name)
 
@@ -642,39 +685,78 @@ function TitleParser.score_series_candidate(candidate, query_title, all_candidat
     local q_clean = strip_articles(q_canon)
     local c_clean = strip_articles(c_canon)
 
+    local cand_year = tonumber(candidate.year)
+    if not cand_year and candidate.releaseInfo then
+        cand_year = tonumber(tostring(candidate.releaseInfo):match("%d%d%d%d"))
+    end
+    if not cand_year and candidate.name then
+        local parens = candidate.name:match("%b()")
+        local y_match = parens and parens:match("(%d%d%d%d)") or candidate.name:match("(%d%d%d%d)")
+        cand_year = tonumber(y_match)
+    end
+
+    local has_year_compatible = false
+    if target_year and all_candidates then
+        for _, other in ipairs(all_candidates) do
+            local oy = tonumber(other.year)
+            if not oy and other.releaseInfo then
+                oy = tonumber(tostring(other.releaseInfo):match("%d%d%d%d"))
+            end
+            if not oy and other.name then
+                local parens = other.name:match("%b()")
+                local ym = parens and parens:match("(%d%d%d%d)") or other.name:match("(%d%d%d%d)")
+                oy = tonumber(ym)
+            end
+            if oy and math.abs(oy - target_year) <= 1 then
+                has_year_compatible = true
+                break
+            end
+        end
+    end
+
+    local score = 0
     if q_canon == c_canon or q_clean == c_clean then
-        return 1000
+        score = 1000
+    else
+        local q_words = {}
+        for w in q_clean:gmatch("%w+") do q_words[w] = true end
+        local c_words = {}
+        local c_extra = 0
+        for w in c_clean:gmatch("%w+") do
+            c_words[w] = true
+            if not q_words[w] then c_extra = c_extra + 1 end
+        end
+
+        local match_count = 0
+        local total_q = 0
+        for w in pairs(q_words) do
+            total_q = total_q + 1
+            if c_words[w] then match_count = match_count + 1 end
+        end
+
+        local word_match_bonus = match_count * 10
+
+        if total_q > 0 and match_count == total_q and c_extra == 0 then
+            score = 800 + word_match_bonus
+        elseif total_q > 0 and match_count == total_q and c_extra <= 1 then
+            score = 400 + word_match_bonus
+        elseif match_count > 0 then
+            score = word_match_bonus
+        else
+            score = 0
+        end
     end
 
-    local q_words = {}
-    for w in q_clean:gmatch("%w+") do q_words[w] = true end
-    local c_words = {}
-    local c_extra = 0
-    for w in c_clean:gmatch("%w+") do
-        c_words[w] = true
-        if not q_words[w] then c_extra = c_extra + 1 end
+    if target_year and cand_year then
+        local diff = math.abs(cand_year - target_year)
+        if diff <= 1 then
+            score = score + 200
+        elseif has_year_compatible and diff > 1 then
+            score = score - 500
+        end
     end
 
-    local match_count = 0
-    local total_q = 0
-    for w in pairs(q_words) do
-        total_q = total_q + 1
-        if c_words[w] then match_count = match_count + 1 end
-    end
-	
-	    local word_match_bonus = match_count * 10
-
-    if total_q > 0 and match_count == total_q and c_extra == 0 then
-        return 800 + word_match_bonus
-    elseif total_q > 0 and match_count == total_q and c_extra <= 1 then
-        return 400  + word_match_bonus
-    end
-
-    if match_count > 0 then
-        return word_match_bonus
-    end
-
-    return 0
+    return score
 end
 
 function TitleParser.extract_media_metadata(path, filename, raw_media_title, metadata)
@@ -764,21 +846,26 @@ function TitleParser.extract_media_metadata(path, filename, raw_media_title, met
         local fn_clean = fn_base:gsub("^%s*%b[]%s*", "")
         fn_clean = fn_clean:gsub("%-[%w_%.]+$", "")
 
-        local parsed_title, parsed_season, parsed_episode, parsed_season_missing = TitleParser.parse_season_episode(fn_clean)
+        local parsed_title, parsed_season, parsed_episode, parsed_season_missing, parsed_year, parsed_twy = TitleParser.parse_season_episode(fn_clean)
         if parsed_title then
             info.is_tv = true
             info.season = parsed_season
             info.episode = parsed_episode
             info.season_missing = parsed_season_missing
             info.title = parsed_title
+            info.title_with_year = parsed_twy
+            if parsed_year then
+                info.year = parsed_year
+            end
         end
 
-        if not info.title then
+        local max_year = TitleParser.max_release_year()
+        if info.is_tv and not info.year then
             local years_found = {}
             local seen_years = {}
             for y_str in fn_clean:gmatch("(%d%d%d%d)") do
                 local y_num = tonumber(y_str)
-                if y_num and y_num >= 1900 and y_num <= 2099 then
+                if y_num and y_num >= 1900 and y_num <= max_year then
                     local is_resolution = fn_clean:find(y_str .. "[pPiI]") ~= nil
                     if not is_resolution and not seen_years[y_num] then
                         seen_years[y_num] = true
@@ -786,25 +873,75 @@ function TitleParser.extract_media_metadata(path, filename, raw_media_title, met
                     end
                 end
             end
-
             if #years_found == 1 then
-                local y = years_found[1]
-                info.year = y
-                local m_title = fn_clean:match("^(.-)[%._%-%s%(]+" .. tostring(y) .. "[%._%-%s%)]*(.*)$")
-                if not m_title or #m_title == 0 then
-                    m_title = fn_clean:match("^(.-)" .. tostring(y))
-                end
-                if m_title and #m_title > 0 then
+                info.year = years_found[1]
+            elseif #years_found > 1 then
+                info.year_ambiguous = true
+            end
+        end
+
+        if not info.title then
+            local parens_y_str = fn_clean:match("%((%d%d%d%d)%)") or fn_clean:match("%[(%d%d%d%d)%]")
+            local parens_y = tonumber(parens_y_str)
+            if parens_y and parens_y >= 1900 and parens_y <= max_year then
+                local m_title = fn_clean:match("^(.-)[%._%-%s%(%[]+" .. parens_y_str)
+                if m_title and m_title:match("%w") then
+                    info.year = parens_y
                     info.title = TitleParser.clean_title(m_title)
+                    info.title_with_year = TitleParser.clean_title(fn_clean)
+                end
+            end
+
+            if not info.title then
+                local years_found = {}
+                local seen_years = {}
+                for y_str in fn_clean:gmatch("(%d%d%d%d)") do
+                    local y_num = tonumber(y_str)
+                    if y_num and y_num >= 1900 and y_num <= max_year then
+                        local is_resolution = fn_clean:find(y_str .. "[pPiI]") ~= nil
+                        if not is_resolution and not seen_years[y_num] then
+                            seen_years[y_num] = true
+                            table.insert(years_found, y_num)
+                        end
+                    end
+                end
+
+                if #years_found == 1 then
+                    local y = years_found[1]
+                    local m_title = fn_clean:match("^(.-)[%._%-%s%(]+" .. tostring(y) .. "[%._%-%s%)]*(.*)$")
+                    if not m_title or #m_title == 0 then
+                        m_title = fn_clean:match("^(.-)" .. tostring(y))
+                    end
+                    if m_title and m_title:match("%w") then
+                        info.year = y
+                        info.title = TitleParser.clean_title(m_title)
+                        info.title_with_year = TitleParser.clean_title(fn_clean)
+                    else
+                        info.title = TitleParser.clean_title(fn_clean)
+                        info.year = nil
+                    end
+                elseif #years_found > 1 then
+                    local y1, y2 = years_found[1], years_found[2]
+                    local adjacent = fn_clean:find(tostring(y1) .. "[%._%-%s]+" .. tostring(y2)) ~= nil
+                    if adjacent and math.abs(y1 - y2) <= 1 then
+                        info.year_ambiguous = true
+                        info.year = nil
+                        info.title = TitleParser.clean_title(fn_clean)
+                    else
+                        local last_y = years_found[#years_found]
+                        local m_title = fn_clean:match("^(.-)[%._%-%s%(]+" .. tostring(last_y) .. "[%._%-%s%)]*(.*)$")
+                        if m_title and m_title:match("%w") then
+                            info.year = last_y
+                            info.title = TitleParser.clean_title(m_title)
+                            info.title_with_year = TitleParser.clean_title(fn_clean)
+                        else
+                            info.title = TitleParser.clean_title(fn_clean)
+                            info.year = nil
+                        end
+                    end
                 else
                     info.title = TitleParser.clean_title(fn_clean)
                 end
-            elseif #years_found > 1 then
-                info.year_ambiguous = true
-                info.year = nil
-                info.title = TitleParser.clean_title(fn_clean)
-            else
-                info.title = TitleParser.clean_title(fn_clean)
             end
         end
     end
@@ -814,13 +951,14 @@ function TitleParser.extract_media_metadata(path, filename, raw_media_title, met
     local parsed_season = nil
     local parsed_episode = nil
     local parsed_season_missing = false
+    local parsed_year = nil
 
     if fn_was_generic and raw_media_title and not raw_media_title:match("^av://") and not raw_media_title:match("^lavfi:") then
         local raw_clean = raw_media_title:gsub("%.[a-zA-Z0-9]+$", "")
         raw_clean = raw_clean:gsub("^%s*%b[]%s*", "")
         raw_clean = raw_clean:gsub("%-[%w_%.]+$", "")
 
-        parsed_title, parsed_season, parsed_episode, parsed_season_missing = TitleParser.parse_season_episode(raw_clean)
+        parsed_title, parsed_season, parsed_episode, parsed_season_missing, parsed_year = TitleParser.parse_season_episode(raw_clean)
     end
 
     if not info.title or #info.title == 0 or fn_was_generic then
@@ -837,6 +975,9 @@ function TitleParser.extract_media_metadata(path, filename, raw_media_title, met
             info.season = parsed_season
             info.episode = parsed_episode
             info.season_missing = parsed_season_missing
+            if parsed_year then
+                info.year = parsed_year
+            end
         elseif not info.title and raw_media_title
                 and not raw_media_title:match("^av://")
                 and not raw_media_title:match("^lavfi:") then
@@ -1211,56 +1352,247 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback)
     end
 
     if user_opts.tmdb_api_key and #user_opts.tmdb_api_key > 0 then
-        local endpoint = media_info.is_tv and "search/tv" or "search/movie"
-        local url = string.format("https://api.themoviedb.org/3/%s?api_key=%s&query=%s",
-            endpoint, user_opts.tmdb_api_key, url_encode(media_info.title))
-        if media_info.year and not media_info.is_tv then
-            url = url .. "&year=" .. tostring(media_info.year)
+        local function tmdb_to_candidate(r)
+            local cand_name = r.title or r.name or ""
+            local date_str  = r.release_date or r.first_air_date or ""
+            local cand_year = tonumber(date_str:match("^(%d%d%d%d)"))
+            return { id = r.id, name = cand_name, year = cand_year and tostring(cand_year) or nil }
         end
 
-        async_http_get(url, nil, 6, function(success, data, err)
-            if state.file_id ~= current_file_id then return end
-            if success and data and data.results and #data.results > 0 then
-                local res1 = data.results[1]
-                media_info.tmdb_id = res1.id
-                log_info("Resolved title '%s' to TMDb ID %d via TMDb API", media_info.title, media_info.tmdb_id)
-
-                local function fetch_external_ids()
-                    local ext_type = media_info.is_tv and "tv" or "movie"
-                    local ext_url = string.format("https://api.themoviedb.org/3/%s/%d/external_ids?api_key=%s",
-                        ext_type, media_info.tmdb_id, user_opts.tmdb_api_key)
-                    async_http_get(ext_url, nil, 4, function(ext_ok, ext_data, ext_err)
-                        if state.file_id ~= current_file_id then return end
-                        if ext_ok and ext_data and ext_data.imdb_id then
-                            media_info.imdb_id = ext_data.imdb_id
-                            log_info("Resolved TMDb ID %d to IMDb ID %s", media_info.tmdb_id, media_info.imdb_id)
-                        end
-                        callback(true)
-                    end)
+        local function pick_best_tmdb(results, query_title, target_year)
+            local candidates = {}
+            for _, r in ipairs(results) do
+                table.insert(candidates, tmdb_to_candidate(r))
+            end
+            local best_c, best_s = nil, 0
+            for rank, c in ipairs(candidates) do
+                local s
+                if media_info.is_tv then
+                    s = TitleParser.score_series_candidate(c, query_title, target_year, candidates)
+                else
+                    s = TitleParser.score_movie_candidate(c, query_title, target_year, candidates)
                 end
+                s = s - (rank - 1) * 0.5
+                log_debug("TMDb candidate #%d '%s' (year=%s) score=%.1f",
+                    rank, c.name, tostring(c.year), s)
+                if s > best_s then
+                    best_s = s
+                    best_c = c
+                end
+            end
+            local min_score = (#candidates == 1) and 10 or 300
+            if best_c and best_s >= min_score then
+                return best_c, best_s
+            end
+            return nil, best_s
+        end
 
-                if media_info.is_tv and media_info.season_missing then
-                    local tv_url = string.format("https://api.themoviedb.org/3/tv/%d?api_key=%s",
-                        media_info.tmdb_id, user_opts.tmdb_api_key)
-                    async_http_get(tv_url, nil, 4, function(tv_ok, tv_data)
-                        if state.file_id ~= current_file_id then return end
-                        if tv_ok and tv_data and tv_data.number_of_seasons and tv_data.number_of_seasons > 1 then
-                            log_warn("Show '%s' has %d seasons, but season was omitted in filename; rejecting ambiguous episode",
-                                media_info.title, tv_data.number_of_seasons)
-                            callback(false)
+        local endpoint = media_info.is_tv and "search/tv" or "search/movie"
+
+        local function build_tmdb_url(query, year)
+            local u = string.format("https://api.themoviedb.org/3/%s?api_key=%s&query=%s",
+                endpoint, user_opts.tmdb_api_key, url_encode(query))
+            if year then
+                if media_info.is_tv then
+                    u = u .. "&first_air_date_year=" .. tostring(year)
+                else
+                    u = u .. "&primary_release_year=" .. tostring(year)
+                end
+            end
+            return u
+        end
+
+        local function fallback_to_cinemeta()
+            log_debug("TMDb found no suitable match for '%s'; falling back to Cinemeta", media_info.title)
+            local catalog_type = media_info.is_tv and "series" or "movie"
+            local cine_url = string.format("https://v3-cinemeta.strem.io/catalog/%s/top/search=%s.json",
+                catalog_type, url_encode(media_info.title))
+
+            async_http_get(cine_url, nil, 6, function(success2, data2, err2)
+                if state.file_id ~= current_file_id then return end
+                if success2 and data2 and data2.metas and #data2.metas > 0 then
+                    local best_meta, best_score = nil, 0
+                    for rank, m in ipairs(data2.metas) do
+                        local score = 0
+                        if media_info.is_tv then
+                            score = TitleParser.score_series_candidate(m, media_info.title, media_info.year, data2.metas)
+                        else
+                            score = TitleParser.score_movie_candidate(m, media_info.title, media_info.year, data2.metas)
+                        end
+                        score = score - (rank - 1) * 0.5
+                        local cand_year = tonumber(m.year) or tonumber(m.releaseInfo)
+                        log_debug("Cinemeta fallback candidate #%d '%s' (year=%s) score=%.1f",
+                            rank, m.name or "", tostring(cand_year), score)
+                        if score > best_score then
+                            best_score = score
+                            best_meta  = m
+                        end
+                    end
+                    local id = best_meta and (best_meta.imdb_id or best_meta.id)
+                    local min_score = (#data2.metas == 1) and 10 or 300
+                    if id and id:match("^tt%d+") and best_score >= min_score then
+                        if media_info.is_tv and media_info.season_missing then
+                            local meta_url = string.format("https://v3-cinemeta.strem.io/meta/series/%s.json", id)
+                            async_http_get(meta_url, nil, 6, function(meta_ok, meta_data, meta_err)
+                                if state.file_id ~= current_file_id then return end
+                                if meta_ok and meta_data and meta_data.meta then
+                                    local ok, cnt = TitleParser.validate_series_seasons(meta_data.meta.videos, media_info)
+                                    if not ok then
+                                        log_warn("Series '%s' has %d seasons but season omitted; rejecting",
+                                            best_meta.name or "?", cnt)
+                                        callback(false)
+                                        return
+                                    end
+                                end
+                                media_info.imdb_id = id
+                                log_info("Resolved '%s' to IMDb ID %s via Cinemeta fallback (score=%.1f)",
+                                    media_info.title, id, best_score)
+                                callback(true)
+                            end)
                             return
                         else
-                            media_info.season = 1
-                            media_info.season_missing = false
-                            fetch_external_ids()
+                            media_info.imdb_id = id
+                            log_info("Resolved '%s' to IMDb ID %s via Cinemeta fallback (score=%.1f)",
+                                media_info.title, id, best_score)
+                            callback(true)
+                            return
                         end
-                    end)
-                else
-                    fetch_external_ids()
+                    end
                 end
-            else
+
+                if media_info.title_with_year and media_info.title_with_year ~= media_info.title then
+                    local retry_url = string.format("https://v3-cinemeta.strem.io/catalog/%s/top/search=%s.json",
+                        catalog_type, url_encode(media_info.title_with_year))
+                    async_http_get(retry_url, nil, 6, function(retry_ok, retry_data, retry_err)
+                        if state.file_id ~= current_file_id then return end
+                        if retry_ok and retry_data and retry_data.metas and #retry_data.metas > 0 then
+                            local r_best_meta, r_best_score = nil, 0
+                            for rank, m in ipairs(retry_data.metas) do
+                                local score = 0
+                                if media_info.is_tv then
+                                    score = TitleParser.score_series_candidate(m, media_info.title_with_year, nil, retry_data.metas)
+                                else
+                                    score = TitleParser.score_movie_candidate(m, media_info.title_with_year, nil, retry_data.metas)
+                                end
+                                score = score - (rank - 1) * 0.5
+                                if score > r_best_score then
+                                    r_best_score = score
+                                    r_best_meta = m
+                                end
+                            end
+                            local r_id = r_best_meta and (r_best_meta.imdb_id or r_best_meta.id)
+                            local r_min = (#retry_data.metas == 1) and 10 or 300
+                            if r_id and r_id:match("^tt%d+") and r_best_score >= r_min then
+                                media_info.imdb_id = r_id
+                                media_info.title = media_info.title_with_year
+                                log_info("Resolved '%s' (year-in-title fallback) to IMDb ID %s via Cinemeta (score=%.1f)",
+                                    media_info.title, r_id, r_best_score)
+                                callback(true)
+                                return
+                            end
+                        end
+                        log_debug("Could not resolve '%s' via Cinemeta", media_info.title)
+                        callback(media_info.tmdb_id ~= nil or media_info.tvdb_id ~= nil)
+                    end)
+                    return
+                end
+
+                log_debug("Could not resolve '%s' via Cinemeta", media_info.title)
                 callback(media_info.tmdb_id ~= nil or media_info.tvdb_id ~= nil)
+            end)
+        end
+
+        local function on_tmdb_match(best_c, log_note)
+            media_info.tmdb_id = best_c.id
+            log_info("Resolved title '%s' to TMDb ID %d via TMDb API%s",
+                media_info.title, media_info.tmdb_id, log_note or "")
+
+            local function fetch_external_ids()
+                local ext_type = media_info.is_tv and "tv" or "movie"
+                local ext_url = string.format("https://api.themoviedb.org/3/%s/%d/external_ids?api_key=%s",
+                    ext_type, media_info.tmdb_id, user_opts.tmdb_api_key)
+                async_http_get(ext_url, nil, 4, function(ext_ok, ext_data, ext_err)
+                    if state.file_id ~= current_file_id then return end
+                    if ext_ok and ext_data and ext_data.imdb_id then
+                        media_info.imdb_id = ext_data.imdb_id
+                        log_info("Resolved TMDb ID %d to IMDb ID %s", media_info.tmdb_id, media_info.imdb_id)
+                    end
+                    callback(true)
+                end)
             end
+
+            if media_info.is_tv and media_info.season_missing then
+                local tv_url = string.format("https://api.themoviedb.org/3/tv/%d?api_key=%s",
+                    media_info.tmdb_id, user_opts.tmdb_api_key)
+                async_http_get(tv_url, nil, 4, function(tv_ok, tv_data)
+                    if state.file_id ~= current_file_id then return end
+                    if tv_ok and tv_data and tv_data.number_of_seasons and tv_data.number_of_seasons > 1 then
+                        log_warn("Show '%s' has %d seasons, but season was omitted in filename; rejecting ambiguous episode",
+                            media_info.title, tv_data.number_of_seasons)
+                        callback(false)
+                        return
+                    else
+                        media_info.season = 1
+                        media_info.season_missing = false
+                        fetch_external_ids()
+                    end
+                end)
+            else
+                fetch_external_ids()
+            end
+        end
+
+        local url1 = build_tmdb_url(media_info.title, media_info.year)
+        async_http_get(url1, nil, 6, function(success, data, err)
+            if state.file_id ~= current_file_id then return end
+            if success and data and data.results and #data.results > 0 then
+                local best_c, best_s = pick_best_tmdb(data.results, media_info.title, media_info.year)
+                if best_c then
+                    on_tmdb_match(best_c)
+                    return
+                end
+            end
+
+            local function try_no_year()
+                if not media_info.year then
+                    try_title_with_year()
+                    return
+                end
+                local url2 = build_tmdb_url(media_info.title, nil)
+                async_http_get(url2, nil, 6, function(ok2, data2, err2)
+                    if state.file_id ~= current_file_id then return end
+                    if ok2 and data2 and data2.results and #data2.results > 0 then
+                        local best_c2, best_s2 = pick_best_tmdb(data2.results, media_info.title, media_info.year)
+                        if best_c2 then
+                            on_tmdb_match(best_c2, " (no-year fallback)")
+                            return
+                        end
+                    end
+                    try_title_with_year()
+                end)
+            end
+
+            function try_title_with_year()
+                if not media_info.title_with_year or media_info.title_with_year == media_info.title then
+                    fallback_to_cinemeta()
+                    return
+                end
+                local url3 = build_tmdb_url(media_info.title_with_year, nil)
+                async_http_get(url3, nil, 6, function(ok3, data3, err3)
+                    if state.file_id ~= current_file_id then return end
+                    if ok3 and data3 and data3.results and #data3.results > 0 then
+                        local best_c3, best_s3 = pick_best_tmdb(data3.results, media_info.title_with_year, nil)
+                        if best_c3 then
+                            media_info.title = media_info.title_with_year
+                            on_tmdb_match(best_c3, " (title-with-year fallback)")
+                            return
+                        end
+                    end
+                    fallback_to_cinemeta()
+                end)
+            end
+
+            try_no_year()
         end)
         return
     end
@@ -1276,7 +1608,7 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback)
             for rank, m in ipairs(data.metas) do
                 local score = 0
                 if media_info.is_tv then
-                    score = TitleParser.score_series_candidate(m, media_info.title, data.metas)
+                    score = TitleParser.score_series_candidate(m, media_info.title, media_info.year, data.metas)
                 else
                     score = TitleParser.score_movie_candidate(m, media_info.title, media_info.year, data.metas)
                 end
@@ -1327,6 +1659,44 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback)
                 end
             end
         end
+
+        if media_info.title_with_year and media_info.title_with_year ~= media_info.title then
+            local retry_url = string.format("https://v3-cinemeta.strem.io/catalog/%s/top/search=%s.json",
+                catalog_type, url_encode(media_info.title_with_year))
+            async_http_get(retry_url, nil, 6, function(retry_ok, retry_data, retry_err)
+                if state.file_id ~= current_file_id then return end
+                if retry_ok and retry_data and retry_data.metas and #retry_data.metas > 0 then
+                    local r_best_meta, r_best_score = nil, 0
+                    for rank, m in ipairs(retry_data.metas) do
+                        local score = 0
+                        if media_info.is_tv then
+                            score = TitleParser.score_series_candidate(m, media_info.title_with_year, nil, retry_data.metas)
+                        else
+                            score = TitleParser.score_movie_candidate(m, media_info.title_with_year, nil, retry_data.metas)
+                        end
+                        score = score - (rank - 1) * 0.5
+                        if score > r_best_score then
+                            r_best_score = score
+                            r_best_meta = m
+                        end
+                    end
+                    local r_id = r_best_meta and (r_best_meta.imdb_id or r_best_meta.id)
+                    local r_min_score = (#retry_data.metas == 1) and 10 or 300
+                    if r_id and r_id:match("^tt%d+") and r_best_score >= r_min_score then
+                        media_info.imdb_id = r_id
+                        media_info.title = media_info.title_with_year
+                        log_info("Resolved title '%s' (fallback with year in title) to IMDb ID %s via Cinemeta (score=%.1f, name='%s')",
+                            media_info.title, r_id, r_best_score, r_best_meta.name or "?")
+                        callback(true)
+                        return
+                    end
+                end
+                log_debug("Could not resolve title '%s' to an IMDb ID via Cinemeta", media_info.title)
+                callback(media_info.tmdb_id ~= nil or media_info.tvdb_id ~= nil)
+            end)
+            return
+        end
+
         log_debug("Could not resolve title '%s' to an IMDb ID via Cinemeta", media_info.title)
         callback(media_info.tmdb_id ~= nil or media_info.tvdb_id ~= nil)
     end)
