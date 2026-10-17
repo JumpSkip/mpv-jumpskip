@@ -7,7 +7,7 @@
     IntroDB (introdb.app), and SkipDB (skipdb.tv).
 
     Features:
-    - Triple provider support: TheIntroDB (v3 OpenAPI), IntroDB (OpenAPI), and SkipDB (openAPI)
+    - Triple provider support: TheIntroDB (v4 OpenAPI), IntroDB (OpenAPI), and SkipDB (openAPI)
     - Movie support: IntroDB end-credits (outro) and post-credits segments (is_movie=true)
     - Automatic provider fallback and intelligent segment merging
     - Fully non-blocking asynchronous HTTP requests using curl via mp.command_native_async
@@ -309,8 +309,13 @@ function TitleParser.clean_title(raw)
     local s = raw
     -- Strip release groups:
     s = s:gsub("^%s*%b[]%s*", "")
-    -- Strip bracketed hashes:
+    local leading_paren = s:match("^%s*%((.-)%)%s*[_%-]?%s*")
+    if leading_paren and not leading_paren:match("^%d%d%d%d$") and not leading_paren:match("^%d+$") then
+        s = s:gsub("^%s*%b()%s*[_%-]?%s*", "")
+    end
+    -- Strip bracketed and parenthesized hashes:
     s = s:gsub("%[[0-9a-fA-F]+%]", " ")
+    s = s:gsub("%([0-9a-fA-F]+%)", " ")
     -- Replace dots, underscores, hyphens with spaces:
     s = s:gsub("[%._%-]", " ")
     -- Strip resolution tags:
@@ -433,6 +438,63 @@ function TitleParser.parse_season_episode(str)
                 st = st:gsub("[%s%._%-]+[eE][pP][%s%._%-]*$", "")
                 s_title, s, e = st, "1", ep
                 season_missing = true
+            end
+        end
+    end
+
+    if not s_title then
+        -- Match anime/series format: Title - 01, Title_-_01, Title.-.01, Title - 01v2, Title - 105
+        local st, ep = str:match("^(.-)[%s%._%-]+%-[%s%._%-]+(%d+)[vV]?%d*[%s%._%-%(%]]")
+        if not st then
+            st, ep = str:match("^(.-)[%s%._%-]+%-[%s%._%-]+(%d+)[vV]?%d*$")
+        end
+        if st and ep then
+            local num = tonumber(ep)
+            local max_year = TitleParser.max_release_year()
+            if num and num > 0 and num <= 2000 and not (num >= 1900 and num <= max_year) then
+                local sea_title, sea_num = st:match("^(.-)[%s%._%-]+[sS](%d%d?)$")
+                if not sea_title then
+                    sea_title, sea_num = st:match("^(.-)[%s%._%-]+[sS]eason[%s%._%-]*(%d%d?)$")
+                end
+                if sea_title and sea_num then
+                    s_title = sea_title
+                    s = sea_num
+                    e = ep
+                    season_missing = false
+                else
+                    s_title = st
+                    s = "1"
+                    e = ep
+                    season_missing = true
+                end
+            end
+        end
+    end
+
+    if not s_title then
+        -- Match zero-padded standalone episode: Title 01, Title 03, Title_01, Title.01
+        local st, ep = str:match("^(.-)[%s%._%-]+(0%d%d?)[vV]?%d*[%s%._%-%(%]]")
+        if not st then
+            st, ep = str:match("^(.-)[%s%._%-]+(0%d%d?)[vV]?%d*$")
+        end
+        if st and ep then
+            local num = tonumber(ep)
+            if num and num > 0 and num <= 999 then
+                local sea_title, sea_num = st:match("^(.-)[%s%._%-]+[sS](%d%d?)$")
+                if not sea_title then
+                    sea_title, sea_num = st:match("^(.-)[%s%._%-]+[sS]eason[%s%._%-]*(%d%d?)$")
+                end
+                if sea_title and sea_num then
+                    s_title = sea_title
+                    s = sea_num
+                    e = ep
+                    season_missing = false
+                else
+                    s_title = st
+                    s = "1"
+                    e = ep
+                    season_missing = true
+                end
             end
         end
     end
@@ -844,7 +906,13 @@ function TitleParser.extract_media_metadata(path, filename, raw_media_title, met
     if use_filename then
         local fn_base = fn:gsub("%.[a-zA-Z0-9]+$", "")
         local fn_clean = fn_base:gsub("^%s*%b[]%s*", "")
-        fn_clean = fn_clean:gsub("%-[%w_%.]+$", "")
+        local leading_paren = fn_clean:match("^%s*%((.-)%)%s*[_%-]?%s*")
+        if leading_paren and not leading_paren:match("^%d%d%d%d$") and not leading_paren:match("^%d+$") then
+            fn_clean = fn_clean:gsub("^%s*%b()%s*[_%-]?%s*", "")
+        end
+        if not fn_clean:match("%-%d+$") and not fn_clean:match("%-%d+v%d+$") then
+            fn_clean = fn_clean:gsub("%-[%w_%.]+$", "")
+        end
 
         local parsed_title, parsed_season, parsed_episode, parsed_season_missing, parsed_year, parsed_twy = TitleParser.parse_season_episode(fn_clean)
         if parsed_title then
@@ -956,7 +1024,13 @@ function TitleParser.extract_media_metadata(path, filename, raw_media_title, met
     if fn_was_generic and raw_media_title and not raw_media_title:match("^av://") and not raw_media_title:match("^lavfi:") then
         local raw_clean = raw_media_title:gsub("%.[a-zA-Z0-9]+$", "")
         raw_clean = raw_clean:gsub("^%s*%b[]%s*", "")
-        raw_clean = raw_clean:gsub("%-[%w_%.]+$", "")
+        local leading_paren = raw_clean:match("^%s*%((.-)%)%s*[_%-]?%s*")
+        if leading_paren and not leading_paren:match("^%d%d%d%d$") and not leading_paren:match("^%d+$") then
+            raw_clean = raw_clean:gsub("^%s*%b()%s*[_%-]?%s*", "")
+        end
+        if not raw_clean:match("%-%d+$") and not raw_clean:match("%-%d+v%d+$") then
+            raw_clean = raw_clean:gsub("%-[%w_%.]+$", "")
+        end
 
         parsed_title, parsed_season, parsed_episode, parsed_season_missing, parsed_year = TitleParser.parse_season_episode(raw_clean)
     end
@@ -1513,9 +1587,15 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback)
                     ext_type, media_info.tmdb_id, user_opts.tmdb_api_key)
                 async_http_get(ext_url, nil, 4, function(ext_ok, ext_data, ext_err)
                     if state.file_id ~= current_file_id then return end
-                    if ext_ok and ext_data and ext_data.imdb_id then
-                        media_info.imdb_id = ext_data.imdb_id
-                        log_info("Resolved TMDb ID %d to IMDb ID %s", media_info.tmdb_id, media_info.imdb_id)
+                    if ext_ok and ext_data then
+                        if ext_data.imdb_id then
+                            media_info.imdb_id = ext_data.imdb_id
+                            log_info("Resolved TMDb ID %d to IMDb ID %s", media_info.tmdb_id, media_info.imdb_id)
+                        end
+                        if ext_data.tvdb_id and not media_info.tvdb_id then
+                            media_info.tvdb_id = ext_data.tvdb_id
+                            log_info("Resolved TMDb ID %d to TVDB ID %d", media_info.tmdb_id, media_info.tvdb_id)
+                        end
                     end
                     callback(true)
                 end)
@@ -1703,20 +1783,25 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback)
 end
 
 local function query_theintrodb(media_info, current_file_id, callback)
-    if not media_info.tmdb_id and not media_info.imdb_id and not media_info.tvdb_id then
-        callback(false, nil, "Missing ID (tmdb_id, imdb_id, or tvdb_id)")
+    if not media_info.tvdb_id and not media_info.tmdb_id and not media_info.imdb_id then
+        callback(false, nil, "Missing ID (tvdb_id, tmdb_id, or imdb_id)")
+        return
+    end
+
+    if media_info.is_tv and (not media_info.season or not media_info.episode) then
+        callback(false, nil, "TheIntroDB requires season and episode for TV shows")
         return
     end
 
     local params = {}
-    if media_info.tmdb_id then
-        table.insert(params, "tmdb_id=" .. tostring(media_info.tmdb_id))
-    elseif media_info.tvdb_id then
+    if media_info.tvdb_id then
         table.insert(params, "tvdb_id=" .. tostring(media_info.tvdb_id))
+    elseif media_info.tmdb_id then
+        table.insert(params, "tmdb_id=" .. tostring(media_info.tmdb_id))
     elseif media_info.imdb_id then
         table.insert(params, "imdb_id=" .. tostring(media_info.imdb_id))
     end
-    if media_info.is_tv and media_info.season and media_info.episode then
+    if media_info.is_tv then
         table.insert(params, "season="  .. tostring(media_info.season))
         table.insert(params, "episode=" .. tostring(media_info.episode))
     end
@@ -1724,7 +1809,7 @@ local function query_theintrodb(media_info, current_file_id, callback)
         table.insert(params, "duration_ms=" .. tostring(round(state.duration * 1000)))
     end
 
-    local url     = "https://api.theintrodb.org/v3/media?" .. table.concat(params, "&")
+    local url     = "https://api.theintrodb.org/v4/media?" .. table.concat(params, "&")
     local headers = build_auth_header(user_opts.theintrodb_api_key, "Authorization: Bearer ")
 
     async_http_get(url, headers, user_opts.request_timeout, function(success, data, err)
@@ -1743,20 +1828,30 @@ local function query_theintrodb(media_info, current_file_id, callback)
         local function add_ranges(list, seg_type, label)
             if not list or type(list) ~= "table" then return end
             for _, item in ipairs(list) do
-                local s_ms    = item.start_ms
-                local e_ms    = item.end_ms
-                local s_sec   = s_ms and (s_ms / 1000.0) or 0.0
-                local e_sec   = e_ms and (e_ms / 1000.0) or (state.duration > 0 and state.duration or nil)
-                if e_ms ~= 0 and e_sec and (e_sec - s_sec) >= user_opts.min_segment_duration then
-                    table.insert(normalized, make_segment(seg_type, label, s_sec, e_sec, "TheIntroDB"))
+                local s_ms = item.start_ms
+                local e_ms = item.end_ms
+                local is_no_segment = false
+                if (seg_type == "intro" or seg_type == "recap") and e_ms == 0 then
+                    is_no_segment = true
+                elseif (seg_type == "outro" or seg_type == "preview") and (s_ms == 0 or e_ms == 0) then
+                    is_no_segment = true
+                end
+
+                if not is_no_segment then
+                    local s_sec = s_ms and (s_ms / 1000.0) or 0.0
+                    local e_sec = e_ms and (e_ms / 1000.0) or (state.duration > 0 and state.duration or nil)
+                    if e_sec and (e_sec - s_sec) >= user_opts.min_segment_duration then
+                        table.insert(normalized, make_segment(seg_type, label, s_sec, e_sec, "TheIntroDB"))
+                    end
                 end
             end
         end
 
-        if user_opts.skip_intro   then add_ranges(data.intro,    "intro",   "Intro")   end
-        if user_opts.skip_recap   then add_ranges(data.recap,    "recap",   "Recap")   end
-        if user_opts.skip_outro   then add_ranges(data.credits,  "outro",   "Credits") end
-        if user_opts.skip_preview then add_ranges(data.preview,  "preview", "Preview") end
+        local outro_label = media_info.is_tv and "Outro" or "Credits"
+        if user_opts.skip_intro   and user_opts.theintrodb_intro_segment   then add_ranges(data.intro,    "intro",   "Intro")       end
+        if user_opts.skip_recap   and user_opts.theintrodb_recap_segment   then add_ranges(data.recap,    "recap",   "Recap")       end
+        if user_opts.skip_outro   and user_opts.theintrodb_outro_segment   then add_ranges(data.credits,  "outro",   outro_label)   end
+        if user_opts.skip_preview and user_opts.theintrodb_preview_segment then add_ranges(data.preview,  "preview", "Preview")     end
 
         log_info("TheIntroDB returned %d segment(s)", #normalized)
         callback(true, normalized, nil)
@@ -1953,7 +2048,7 @@ local function interpret_submission_error(http_code, err, provider)
         elseif http_code == 400 or http_code == 422 then
             return string.format("%s: Validation error (HTTP %d): %s", provider, http_code, tostring(err or ""))
         elseif http_code == 409 then
-            return string.format("%s: Already submitted (HTTP %d)", provider, http_code)
+            return string.format("%s: Conflict (HTTP %d): %s", provider, http_code, tostring(err or "already submitted"))
         elseif http_code == 429 then
             return string.format("%s: Rate limited (HTTP 429), retry later", provider)
         elseif http_code >= 500 then
@@ -1977,37 +2072,56 @@ local function submit_to_theintrodb(media_info, submission_data, callback)
         return
     end
     
-    if not media_info.tmdb_id then
-        callback(false, "TheIntroDB requires TMDB ID")
+    if not media_info.tvdb_id and not media_info.tmdb_id and not media_info.imdb_id then
+        callback(false, "TheIntroDB requires tvdb_id, tmdb_id, or imdb_id")
+        return
+    end
+
+    if media_info.is_tv and (not media_info.season or not media_info.episode) then
+        callback(false, "TheIntroDB requires season and episode for TV shows")
         return
     end
     
     local body = {
-        tmdb_id = media_info.tmdb_id,
         type = media_info.is_tv and "tv" or "movie",
         segment = seg_type,
         start_sec = submission_data.start_sec,
         end_sec = submission_data.end_sec,
-        video_duration_ms = state.duration > 0 and round(state.duration * 1000) or nil,
     }
+
+    if media_info.tvdb_id then
+        body.tvdb_id = media_info.tvdb_id
+    elseif media_info.tmdb_id then
+        body.tmdb_id = media_info.tmdb_id
+    elseif media_info.imdb_id then
+        body.imdb_id = media_info.imdb_id
+    end
+
+    if media_info.imdb_id and not body.imdb_id then
+        body.imdb_id = media_info.imdb_id
+    end
     
     if media_info.is_tv then
         body.season = media_info.season
         body.episode = media_info.episode
     end
     
-    if media_info.imdb_id then
-        body.imdb_id = media_info.imdb_id
+    if state.duration and state.duration > 0 then
+        local dur_ms = round(state.duration * 1000)
+        if dur_ms >= 300000 and dur_ms <= 21600000 then
+            body.video_duration_ms = dur_ms
+        end
     end
     
     local headers = build_auth_header(user_opts.theintrodb_api_key, "Authorization: Bearer ")
-    local url = "https://api.theintrodb.org/v3/submit"
+    local url = "https://api.theintrodb.org/v4/submit"
     
     async_http_post(url, headers, body, user_opts.request_timeout, function(success, data, err, http_code)
-        if success then
+        if success and http_code >= 200 and http_code < 300 and data and data.ok ~= false and not data.error then
             callback(true, data)
         else
-            callback(false, interpret_submission_error(http_code, err, "TheIntroDB"))
+            local err_msg = (data and type(data) == "table" and data.error) or err
+            callback(false, interpret_submission_error(http_code, err_msg, "TheIntroDB"))
         end
     end)
 end
@@ -2432,6 +2546,9 @@ render_submission_overlay = function()
     y = y + 30
 
     local id_parts = {}
+    if media_info and media_info.tvdb_id then
+        table.insert(id_parts, "TVDB: " .. media_info.tvdb_id)
+    end
     if media_info and media_info.imdb_id then
         table.insert(id_parts, "IMDB: " .. media_info.imdb_id)
     end
