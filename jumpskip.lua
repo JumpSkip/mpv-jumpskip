@@ -443,7 +443,6 @@ function TitleParser.parse_season_episode(str)
     end
 
     if not s_title then
-        -- Match anime/series format: Title - 01, Title_-_01, Title.-.01, Title - 01v2, Title - 105
         local st, ep = str:match("^(.-)[%s%._%-]+%-[%s%._%-]+(%d+)[vV]?%d*[%s%._%-%(%]]")
         if not st then
             st, ep = str:match("^(.-)[%s%._%-]+%-[%s%._%-]+(%d+)[vV]?%d*$")
@@ -472,7 +471,6 @@ function TitleParser.parse_season_episode(str)
     end
 
     if not s_title then
-        -- Match zero-padded standalone episode: Title 01, Title 03, Title_01, Title.01
         local st, ep = str:match("^(.-)[%s%._%-]+(0%d%d?)[vV]?%d*[%s%._%-%(%]]")
         if not st then
             st, ep = str:match("^(.-)[%s%._%-]+(0%d%d?)[vV]?%d*$")
@@ -1296,12 +1294,15 @@ local function extract_media_metadata()
 end
 
 local function async_http_get(url, headers, timeout_sec, callback)
+    local body_file = os.tmpname()
     local args = {
         "curl", "-s", "-S",
         "--max-time",        tostring(timeout_sec or user_opts.request_timeout),
         "--connect-timeout", "4",
         "-H", "User-Agent: mpv-skip-segment/1.0",
         "-H", "Accept: application/json",
+        "-w", "%{http_code}",
+        "-o", body_file,
     }
 
     if headers then
@@ -1321,25 +1322,35 @@ local function async_http_get(url, headers, timeout_sec, callback)
         capture_stderr = true,
         playback_only  = false,
     }, function(success, res, err)
+        local http_code = 0
+        if res and res.stdout then
+            http_code = tonumber(res.stdout:match("%d+")) or 0
+        end
+        local body = ""
+        local f = io.open(body_file, "r")
+        if f then
+            body = f:read("*a") or ""
+            f:close()
+            os.remove(body_file)
+        end
         if not success or not res then
             log_debug("curl execution error: %s", tostring(err))
-            callback(false, nil, err or "curl execution failed")
+            callback(false, nil, err or "curl execution failed", http_code)
             return
         end
         if res.status ~= 0 then
             local err_msg = string.format("curl error (exit code %d): %s", res.status, res.stderr or "")
             log_debug("%s", err_msg)
-            callback(false, nil, err_msg)
+            callback(false, nil, err_msg, http_code)
             return
         end
-        local stdout = res.stdout or ""
-        local parsed, parse_err = utils.parse_json(stdout)
+        local parsed, parse_err = utils.parse_json(body)
         if parse_err or not parsed then
             log_debug("JSON parse error from %s: %s", url, tostring(parse_err))
-            callback(false, stdout, "invalid JSON: " .. tostring(parse_err))
+            callback(false, body, "invalid JSON: " .. tostring(parse_err), http_code)
             return
         end
-        callback(true, parsed, nil)
+        callback(true, parsed, nil, http_code)
     end)
 end
 
@@ -1812,10 +1823,15 @@ local function query_theintrodb(media_info, current_file_id, callback)
     local url     = "https://api.theintrodb.org/v4/media?" .. table.concat(params, "&")
     local headers = build_auth_header(user_opts.theintrodb_api_key, "Authorization: Bearer ")
 
-    async_http_get(url, headers, user_opts.request_timeout, function(success, data, err)
+    async_http_get(url, headers, user_opts.request_timeout, function(success, data, err, http_code)
         if state.file_id ~= current_file_id then return end
         if not success or not data then
             callback(false, nil, err or "TheIntroDB request failed")
+            return
+        end
+        if http_code == 404 then
+            log_info("TheIntroDB returned 0 segment(s)")
+            callback(true, {}, nil)
             return
         end
         if data.error then
