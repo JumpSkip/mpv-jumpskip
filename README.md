@@ -55,6 +55,7 @@ All colors are changeable in **`modernz.conf`** or **`uosc.conf`**
   - Requires a provider API key.
 - **Chapter-based skipping**:
   - Automatically skips chapters based on title (eg. "OP" or "Outro", "Recap" etc.).
+  - Works without configured providers and when media identification fails.
 - **Keyboard Shortcut**:
   - Instant skipping via configurable keybind (default: `Tab`).
 - **Configurable Auto-Skip**:

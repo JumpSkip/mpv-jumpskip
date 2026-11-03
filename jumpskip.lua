@@ -1,6 +1,6 @@
 --[[
     mpv-skip-segment
-    version 2.0
+    version 2.1
     ================
     A Lua script for mpv that detects and skips segments (intros, recaps, outros/credits, previews,
     and movie end-credits/post-credits) using crowdsourced data from TheIntroDB (api.theintrodb.org),
@@ -107,6 +107,9 @@ local user_opts = {
     chapter_skip_overlap_threshold = 0.5,
 }
 
+local default_opts = {}
+for key, value in pairs(user_opts) do default_opts[key] = value end
+
 local function log_info(msg, ...)
     mp.msg.info(string.format(msg, ...))
 end
@@ -161,6 +164,7 @@ local VALID_PROVIDERS = { theintrodb = true, introdb = true, skipdb = true }
 
 local function parse_provider_priority(priority_str)
     local providers = {}
+    local seen = {}
     if not priority_str or #priority_str == 0 then
         return providers
     end
@@ -168,7 +172,10 @@ local function parse_provider_priority(priority_str)
         local p = token:match("^%s*(.-)%s*$"):lower()
         if #p > 0 then
             if VALID_PROVIDERS[p] then
-                table.insert(providers, p)
+                if not seen[p] then
+                    table.insert(providers, p)
+                    seen[p] = true
+                end
             else
                 log_warn("Ignoring unknown provider '%s' in priority list (valid: theintrodb, introdb, skipdb)", p)
             end
@@ -203,17 +210,17 @@ local function validate_options()
 end
 
 local function load_configuration()
-    options.read_options(user_opts, "jumpskip")
+    for key, value in pairs(default_opts) do user_opts[key] = value end
 
     local script_dir = debug.getinfo(1, 'S').source:match("@?(.*[/\\])")
-    local candidates = {
-        script_dir and (script_dir .. "jumpskip.conf") or nil,
-        script_dir and (script_dir .. "../jumpskip.conf") or nil,
-        script_dir and (script_dir .. "../script-opts/jumpskip.conf") or nil,
-        script_dir and (script_dir .. "../scripts-opts/jumpskip.conf") or nil,
-        "./jumpskip.conf",
-        "./script-opts/jumpskip.conf",
-    }
+    local candidates = {}
+    if script_dir then
+        for _, relative in ipairs({'jumpskip.conf', '../jumpskip.conf', '../script-opts/jumpskip.conf', '../scripts-opts/jumpskip.conf'}) do
+            candidates[#candidates + 1] = script_dir .. relative
+        end
+    end
+    candidates[#candidates + 1] = './jumpskip.conf'
+    candidates[#candidates + 1] = './script-opts/jumpskip.conf'
 
     local loaded_from = nil
     for _, path in ipairs(candidates) do
@@ -247,6 +254,7 @@ local function load_configuration()
         end
     end
 
+    options.read_options(user_opts, "jumpskip")
     validate_options()
     update_keybind()
     update_submission_keybind()
@@ -309,7 +317,6 @@ local function trim_title(s)
 end
 
 local function has_title(s)
-    -- Lua's %w is ASCII-only; UTF-8 title bytes are meaningful too.
     return s and s:find('[%w\128-\255]') ~= nil
 end
 
@@ -1087,130 +1094,84 @@ local function extract_media_metadata()
     return info
 end
 
-local function async_http_get(url, headers, timeout_sec, callback)
-    local body_file = os.tmpname()
-    local args = {
-        "curl", "-s", "-S",
-        "--max-time",        tostring(timeout_sec or user_opts.request_timeout),
-        "--connect-timeout", "4",
-        "-H", "User-Agent: mpv-skip-segment/1.0",
-        "-H", "Accept: application/json",
-        "-w", "%{http_code}",
-        "-o", body_file,
-    }
-
-    if headers then
-        for _, h in ipairs(headers) do
-            table.insert(args, "-H")
-            table.insert(args, h)
+local function redact_http_secrets(value)
+    return tostring(value or ''):gsub('([?&]([^=&#]+)=)([^&#%s]*)', function(prefix, key, secret)
+        local normalized = key:lower():gsub('[_%-]', '')
+        if normalized == 'apikey' or normalized == 'token' or normalized == 'accesstoken' then
+            return prefix .. '[redacted]'
         end
-    end
-
-    table.insert(args, url)
-    log_debug("HTTP GET: %s", url)
-
-    mp.command_native_async({
-        name           = "subprocess",
-        args           = args,
-        capture_stdout = true,
-        capture_stderr = true,
-        playback_only  = false,
-    }, function(success, res, err)
-        local http_code = 0
-        if res and res.stdout then
-            http_code = tonumber(res.stdout:match("%d+")) or 0
-        end
-        local body = ""
-        local f = io.open(body_file, "r")
-        if f then
-            body = f:read("*a") or ""
-            f:close()
-            os.remove(body_file)
-        end
-        if not success or not res then
-            log_debug("curl execution error: %s", tostring(err))
-            callback(false, nil, err or "curl execution failed", http_code)
-            return
-        end
-        if res.status ~= 0 then
-            local err_msg = string.format("curl error (exit code %d): %s", res.status, res.stderr or "")
-            log_debug("%s", err_msg)
-            callback(false, nil, err_msg, http_code)
-            return
-        end
-        local parsed, parse_err = utils.parse_json(body)
-        if parse_err or not parsed then
-            log_debug("JSON parse error from %s: %s", url, tostring(parse_err))
-            callback(false, body, "invalid JSON: " .. tostring(parse_err), http_code)
-            return
-        end
-        callback(true, parsed, nil, http_code)
+        return prefix .. secret
     end)
 end
 
-local function async_http_post(url, headers, data, timeout_sec, callback)
-    local json_data = utils.format_json(data)
-    local status_file = os.tmpname()
+local function async_http_request(method, url, headers, data, timeout_sec, callback)
+    local json_data
+    if method == 'POST' then
+        local err
+        json_data, err = utils.format_json(data)
+        if not json_data then callback(false, nil, 'JSON encoding failed: ' .. tostring(err), 0); return end
+    end
+    local body_file = os.tmpname()
     local args = {
-        "curl", "-s", "-S",
-        "--max-time",        tostring(timeout_sec or user_opts.request_timeout),
-        "--connect-timeout", "4",
-        "-H", "User-Agent: mpv-skip-segment/1.0",
-        "-H", "Accept: application/json",
-        "-H", "Content-Type: application/json",
-        "-X", "POST",
-        "-d", json_data,
-        "-w", "%{http_code}",
-        "-o", status_file,
+        'curl', '-s', '-S', '--max-time', tostring(timeout_sec or user_opts.request_timeout),
+        '--connect-timeout', '4', '-H', 'User-Agent: mpv-skip-segment/1.0',
+        '-H', 'Accept: application/json', '-w', '%{http_code}', '-o', body_file,
     }
-
-    if headers then
-        for _, h in ipairs(headers) do
-            table.insert(args, "-H")
-            table.insert(args, h)
+    if method == 'POST' then
+        for _, arg in ipairs({'-H', 'Content-Type: application/json', '-X', 'POST', '--data-binary', json_data}) do
+            args[#args + 1] = arg
         end
     end
+    for _, header in ipairs(headers or {}) do
+        args[#args + 1], args[#args + 2] = '-H', header
+    end
+    args[#args + 1] = url
+    log_debug('HTTP %s: %s', method, redact_http_secrets(url))
 
-    table.insert(args, url)
-    log_debug("HTTP POST: %s", url)
-
-    mp.command_native_async({
-        name           = "subprocess",
-        args           = args,
-        capture_stdout = true,
-        capture_stderr = true,
-        playback_only  = false,
-    }, function(success, res, err)
-        local http_code = 0
-        if res and res.stdout then
-            http_code = tonumber(res.stdout:match("%d+")) or 0
-        end
-        local body = ""
-        local f = io.open(status_file, "r")
-        if f then
-            body = f:read("*a") or ""
-            f:close()
-            os.remove(status_file)
-        end
-        if not success or not res then
-            log_debug("curl execution error: %s", tostring(err))
-            callback(false, nil, err or "curl execution failed", http_code)
-            return
-        end
-        if res.status ~= 0 then
-            local err_msg = string.format("curl error (exit code %d): %s", res.status, res.stderr or "")
-            log_debug("%s", err_msg)
-            callback(false, nil, err_msg, http_code)
+    local completed_once = false
+    local function completed(success, res, err)
+        if completed_once then return end
+        completed_once = true
+        local code = tonumber(res and res.stdout and res.stdout:match('(%d%d%d)%s*$')) or 0
+        local body = ''
+        local f = io.open(body_file, 'rb')
+        if f then body = f:read('*a') or ''; f:close() end
+        os.remove(body_file)
+        if not success or not res or res.status ~= 0 then
+            local message = res and ('curl error (exit code ' .. tostring(res.status) .. '): ' .. (res.stderr or ''))
+                or err or 'curl execution failed'
+            callback(false, nil, redact_http_secrets(message), code)
             return
         end
         local parsed, parse_err = utils.parse_json(body)
-        if parse_err or not parsed then
-            log_debug("JSON parse error from %s: %s", url, tostring(parse_err))
-            callback(false, body, "invalid JSON: " .. tostring(parse_err), http_code)
-            return
+        if code < 200 or code >= 300 then
+            local detail = type(parsed) == 'table' and (parsed.error or parsed.message) or nil
+            callback(false, parsed, 'HTTP ' .. code .. (detail and (': ' .. tostring(detail)) or ''), code)
+        elseif code == 204 and not body:match('%S') then
+            callback(true, {}, nil, code)
+        elseif parse_err or type(parsed) ~= 'table' then
+            callback(false, nil, 'invalid JSON response: ' .. tostring(parse_err or 'expected an object or array'), code)
+        else
+            callback(true, parsed, nil, code)
         end
-        callback(true, parsed, nil, http_code)
-    end)
+    end
+    local ok, request_id = pcall(mp.command_native_async, {
+        name='subprocess', args=args, capture_stdout=true, capture_stderr=true, playback_only=false,
+    }, completed)
+    if not ok then
+        os.remove(body_file)
+        if completed_once then error(request_id) end
+        completed_once = true
+        callback(false, nil, redact_http_secrets(request_id), 0)
+    end
+end
+
+local function async_http_get(url, headers, timeout_sec, callback)
+    return async_http_request('GET', url, headers, nil, timeout_sec, callback)
+end
+
+local function async_http_post(url, headers, data, timeout_sec, callback)
+    return async_http_request('POST', url, headers, data, timeout_sec, callback)
 end
 
 local function resolve_title_to_imdb(media_info, current_file_id, callback)
@@ -1379,13 +1340,13 @@ local function query_theintrodb(media_info, current_file_id, callback)
 
     async_http_get(url, headers, user_opts.request_timeout, function(success, data, err, http_code)
         if state.file_id ~= current_file_id then return end
-        if not success or not data then
-            callback(false, nil, err or "TheIntroDB request failed")
-            return
-        end
         if http_code == 404 then
             log_info("TheIntroDB returned 0 segment(s)")
             callback(true, {}, nil)
+            return
+        end
+        if not success or not data then
+            callback(false, nil, err or "TheIntroDB request failed")
             return
         end
         if data.error then
@@ -1589,6 +1550,10 @@ local function validate_submission_data(data)
     if start_sec == nil or end_sec == nil then
         return false, "Start and end times are required"
     end
+    if type(start_sec) ~= 'number' or type(end_sec) ~= 'number'
+        or start_sec ~= start_sec or end_sec ~= end_sec then
+        return false, 'Times must be valid numbers'
+    end
     
     if start_sec < 0 or end_sec < 0 then
         return false, "Times cannot be negative"
@@ -1633,6 +1598,15 @@ local function interpret_submission_error(http_code, err, provider)
         end
     end
     return string.format("%s: %s", provider, tostring(err or "submission failed"))
+end
+
+local function finish_submission(provider, success, data, err, http_code, callback)
+    if success and type(data) == 'table' and data.ok ~= false and data.success ~= false and not data.error then
+        callback(true, data)
+    else
+        local detail = type(data) == 'table' and (data.error or data.message) or nil
+        callback(false, interpret_submission_error(http_code, detail or err, provider))
+    end
 end
 
 local function submit_to_theintrodb(media_info, submission_data, callback)
@@ -1692,12 +1666,7 @@ local function submit_to_theintrodb(media_info, submission_data, callback)
     local url = "https://api.theintrodb.org/v4/submit"
     
     async_http_post(url, headers, body, user_opts.request_timeout, function(success, data, err, http_code)
-        if success and http_code >= 200 and http_code < 300 and data and data.ok ~= false and not data.error then
-            callback(true, data)
-        else
-            local err_msg = (data and type(data) == "table" and data.error) or err
-            callback(false, interpret_submission_error(http_code, err_msg, "TheIntroDB"))
-        end
+        finish_submission('TheIntroDB', success, data, err, http_code, callback)
     end)
 end
 
@@ -1749,11 +1718,7 @@ local function submit_to_introdb(media_info, submission_data, callback)
     local url = "https://api.introdb.app/submit"
     
     async_http_post(url, headers, body, user_opts.request_timeout, function(success, data, err, http_code)
-        if success then
-            callback(true, data)
-        else
-            callback(false, interpret_submission_error(http_code, err, "IntroDB"))
-        end
+        finish_submission('IntroDB', success, data, err, http_code, callback)
     end)
 end
 
@@ -1791,51 +1756,27 @@ local function submit_to_skipdb(media_info, submission_data, callback)
     local url = "https://api.skipdb.tv/api/segments"
     
     async_http_post(url, headers, body, user_opts.request_timeout, function(success, data, err, http_code)
-        if success then
-            callback(true, data)
-        else
-            callback(false, interpret_submission_error(http_code, err, "SkipDB"))
-        end
+        finish_submission('SkipDB', success, data, err, http_code, callback)
     end)
 end
 
 local function submit_to_all_providers(media_info, submission_data, callback)
-    local results = {}
-    local pending = 0
-    
-    local function check_done()
-        pending = pending - 1
-        if pending == 0 then
-            callback(results)
+    local results, jobs = {}, {}
+    local functions = {theintrodb=submit_to_theintrodb, introdb=submit_to_introdb, skipdb=submit_to_skipdb}
+    for _, name in ipairs({'theintrodb', 'introdb', 'skipdb'}) do
+        if user_opts[name .. '_submit_enabled'] and (user_opts[name .. '_api_key'] or '') ~= '' then
+            jobs[#jobs + 1] = {name=name, submit=functions[name]}
         end
     end
-    
-    if user_opts.theintrodb_submit_enabled and user_opts.theintrodb_api_key and #user_opts.theintrodb_api_key > 0 then
-        pending = pending + 1
-        submit_to_theintrodb(media_info, submission_data, function(success, data)
-            results.theintrodb = { success = success, data = data }
-            check_done()
+    local pending = #jobs
+    if pending == 0 then callback(results); return end
+    for _, job in ipairs(jobs) do
+        job.submit(media_info, submission_data, function(success, data)
+            if results[job.name] then return end
+            results[job.name] = {success=success, data=data}
+            pending = pending - 1
+            if pending == 0 then callback(results) end
         end)
-    end
-    
-    if user_opts.introdb_submit_enabled and user_opts.introdb_api_key and #user_opts.introdb_api_key > 0 then
-        pending = pending + 1
-        submit_to_introdb(media_info, submission_data, function(success, data)
-            results.introdb = { success = success, data = data }
-            check_done()
-        end)
-    end
-    
-    if user_opts.skipdb_submit_enabled and user_opts.skipdb_api_key and #user_opts.skipdb_api_key > 0 then
-        pending = pending + 1
-        submit_to_skipdb(media_info, submission_data, function(success, data)
-            results.skipdb = { success = success, data = data }
-            check_done()
-        end)
-    end
-    
-    if pending == 0 then
-        callback({})
     end
 end
 
@@ -1927,7 +1868,9 @@ local function submission_submit()
     data.status = "Submitting..."
     data.status_color = "FFD700"
     render_submission_overlay()
+    local current_file_id = state.file_id
     submit_to_all_providers(state.media_info, data, function(results)
+        if state.file_id ~= current_file_id then return end
         data.submitting = false
         local success_count = 0
         local total = 0
@@ -2340,20 +2283,15 @@ local function log_segments_summary(segments, providers_raw)
     mp.msg.info("[jumpskip] " .. sep)
 end
 
-local function has_segment_type(segments_list, seg_type)
-    for _, seg in ipairs(segments_list) do
-        if seg.type == seg_type then return true end
-    end
-    return false
-end
-
 local function merge_segment_lists(primary, secondary)
     local result = {}
+    local primary_types = {}
     for _, s in ipairs(primary) do
         table.insert(result, s)
+        primary_types[s.type] = true
     end
     for _, s in ipairs(secondary) do
-        if not has_segment_type(result, s.type) then
+        if not primary_types[s.type] then
             table.insert(result, s)
             log_info("Merged missing '%s' segment from %s into final segments list", s.label, s.provider)
         end
@@ -2624,106 +2562,60 @@ local function get_provider_priority(media_info)
 end
 
 local function query_segments_pipeline()
-    if not user_opts.enabled then return end
+    state.query_id = (state.query_id or 0) + 1
+    local current_query_id, current_file_id = state.query_id, state.file_id
+    state.query_in_progress = false
+    if not user_opts.enabled or not state.media_info then return end
 
-    local current_file_id    = state.file_id
-    state.query_in_progress  = true
-    state.segments_loaded    = false
-    state.segments           = {}
-
-    local media_info = state.media_info
-    if not media_info then return end
-
-    local providers = get_provider_priority(media_info)
-
-    if #providers == 0 then
-        state.segments_loaded    = true
-        state.query_in_progress  = false
-        log_info("No providers configured for %s; skipping segment query.",
-            media_info.is_tv and "tvshow" or "movie")
-        return
+    local media_info = {}
+    for key, value in pairs(state.media_info) do media_info[key] = value end
+    local function is_current()
+        return state.file_id == current_file_id and state.query_id == current_query_id
     end
+    state.query_in_progress, state.segments_loaded = true, false
+    state.segments = {}
+    local providers = get_provider_priority(media_info)
+    local media_type = media_info.is_tv and 'tvshow' or 'movie'
+    mp.commandv('script-message', 'jumpskip-provider-order', media_type, table.concat(providers, ','))
 
-    local media_type = media_info.is_tv and "tvshow" or "movie"
-    mp.commandv("script-message", "jumpskip-provider-order", media_type, table.concat(providers, ","))
-
-    log_info("Querying segment timestamps from %d provider(s) [%s]: %s...", #providers, media_type, table.concat(providers, " -> "))
-
-    resolve_title_to_imdb(media_info, current_file_id, function(id_found)
-        if state.file_id ~= current_file_id then return end
-
-        local results = {}
-        local pending = #providers
-
-        for idx, pname in ipairs(providers) do
-            local query_fn = provider_fns[pname]
-            if not query_fn then
-                pending     = pending - 1
-                results[idx] = { name = pname, ok = false, segs = {}, err = "Unknown provider: " .. pname }
-            else
-                query_fn(media_info, current_file_id, function(ok, segs, err)
-                    if state.file_id ~= current_file_id then return end
-                    results[idx] = {
-                        name = pname,
-                        ok   = ok,
-
-                        segs = (ok and segs) and filter_provider_segments(segs) or {},
-                        err  = err,
-                    }
-                    pending = pending - 1
-                    if pending == 0 then
-                        local providers_raw = {}
-                        for i = 1, #providers do
-                            table.insert(providers_raw, results[i])
-                        end
-
-                        local final_segs = {}
-                        if not user_opts.merge_providers then
-                            for i = 1, #providers do
-                                if results[i].ok and #results[i].segs > 0 then
-                                    final_segs = results[i].segs
-                                    break
-                                end
-                            end
-                        else
-                            for i = 1, #providers do
-                                if results[i].ok and #results[i].segs > 0 then
-                                    if #final_segs == 0 then
-                                        final_segs = results[i].segs
-                                    else
-                                        final_segs = merge_segment_lists(final_segs, results[i].segs)
-                                    end
-                                end
-                            end
-                        end
-
-                        if user_opts.chapter_skip_enabled then
-                            local base_chapters = state.base_chapter_list
-                                or mp.get_property_native("chapter-list") or {}
-                            local chapter_segs = detect_chapter_segments(base_chapters, state.duration, final_segs, state.media_info)
-                            if #chapter_segs > 0 then
-                                log_info("Adding %d chapter-derived segment(s) to fill provider gaps", #chapter_segs)
-                                for _, seg in ipairs(chapter_segs) do
-                                    table.insert(final_segs, seg)
-                                end
-                                table.sort(final_segs, function(a, b) return a.start_sec < b.start_sec end)
-                            end
-                        end
-
-                        state.segments        = final_segs
-                        state.segments_loaded = true
-                        state.query_in_progress = false
-                        log_segments_summary(state.segments, providers_raw)
-                        publish_segments(final_segs)
-                    end
-                end)
+    local finished = false
+    local function finish(results)
+        if finished or not is_current() then return end
+        finished = true
+        local final_segs = {}
+        for _, result in ipairs(results) do
+            if result.ok and #result.segs > 0 then
+                final_segs = merge_segment_lists(final_segs, result.segs)
+                if not user_opts.merge_providers then break end
             end
         end
-
-        if pending == 0 then
-            state.segments_loaded   = true
-            state.query_in_progress = false
-            log_segments_summary({}, {})
+        if user_opts.chapter_skip_enabled then
+            local chapters = state.base_chapter_list or mp.get_property_native('chapter-list') or {}
+            local derived = detect_chapter_segments(chapters, state.duration, final_segs, media_info)
+            for _, segment in ipairs(derived) do final_segs[#final_segs + 1] = segment end
+        end
+        table.sort(final_segs, function(a, b) return a.start_sec < b.start_sec end)
+        state.media_info, state.segments = media_info, final_segs
+        state.segments_loaded, state.query_in_progress = true, false
+        log_segments_summary(final_segs, results)
+        publish_segments(final_segs)
+    end
+    if #providers == 0 then finish({}); return end
+    log_info('Querying segment timestamps from %d provider(s) [%s]: %s...', #providers, media_type, table.concat(providers, ' -> '))
+    resolve_title_to_imdb(media_info, current_file_id, function(id_found)
+        if not is_current() then return end
+        if not id_found then finish({}); return end
+        local results, pending = {}, #providers
+        for idx, name in ipairs(providers) do
+            local function completed(ok, segs, err)
+                if not is_current() or results[idx] then return end
+                results[idx] = {name=name, ok=ok, segs=ok and segs and filter_provider_segments(segs) or {}, err=err}
+                pending = pending - 1
+                if pending == 0 then finish(results) end
+            end
+            local query = provider_fns[name]
+            if query then query(media_info, current_file_id, completed)
+            else completed(false, nil, 'Unknown provider: ' .. name) end
         end
     end)
 end
@@ -2937,6 +2829,9 @@ local function check_playback_position(current_time)
 
     if matched_segment then
         if state.active_segment ~= matched_segment then
+            if state.auto_skip_timer then state.auto_skip_timer:kill(); state.auto_skip_timer = nil end
+            if state.button_timeout_timer then state.button_timeout_timer:kill(); state.button_timeout_timer = nil end
+            state.auto_skip_target_time = nil
             state.active_segment = matched_segment
             state.button_visible = true
             log_info("Playback entered %s segment (%.2fs (%s) - %.2fs (%s))",
@@ -3039,6 +2934,14 @@ end
 
 local function reset_state()
     state.file_id          = state.file_id + 1
+    state.query_id         = (state.query_id or 0) + 1
+    state.path             = nil
+    state.filename         = nil
+    state.duration         = 0
+    state.media_info       = nil
+    state.query_in_progress = false
+    state.last_time        = nil
+    state.auto_skip_target_time = nil
     state.active_segment   = nil
     state.button_visible   = false
     state.mouse_hover      = false
