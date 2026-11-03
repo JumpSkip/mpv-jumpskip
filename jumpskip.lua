@@ -802,6 +802,9 @@ function TitleParser.extract_media_metadata(path, filename, raw_media_title, met
     if remote or manifest then
         local display_is_filename = raw_media_title == path or media_basename(raw_media_title, remote) == fn
         local stream_title = (not display_is_filename and raw_info) or tag_info
+        if tag_info and tag_info.is_tv and (not stream_title or not stream_title.is_tv) then
+            stream_title = tag_info
+        end
         if stream_title and (manifest or not file_info or not file_info.is_tv or stream_title.is_tv) then
             chosen = stream_title
         end
