@@ -91,7 +91,7 @@ All colors are changeable in **`modernz.conf`** or **`uosc.conf`**
 
 ## Installation
 
-1. Download [jumpskip.lua](https://raw.githubusercontent.com/JumpSkip/mpv-jumpskip/main/jumpskip.lua) and [jumpskip.conf](https://raw.githubusercontent.com/JumpSkip/mpv-jumpskip/main/jumpskip.conf)
+1. Download [jumpskip.lua](https://github.com/JumpSkip/mpv-jumpskip/releases/latest/download/jumpskip.lua) and [jumpskip.conf](https://github.com/JumpSkip/mpv-jumpskip/releases/latest/download/jumpskip.conf)
 
 2. Copy `jumpskip.lua` and `jumpskip.conf` into your mpv config directory
 
@@ -260,8 +260,5 @@ debug_mode=no
 Click [Here](https://github.com/JumpSkip/mpv-jumpskip/wiki/Changelog)
 
 ## Contributing
-
-Run the [media identification tests](tests/README.md) when changing title parsing
-or catalog matching. The default suite runs offline; live Cinemeta checks are optional.
 
 Suggestions and contributions are welcome. Feel free to open an [issue](https://github.com/JumpSkip/mpv-jumpskip/issues) or submit a [pull request](https://github.com/JumpSkip/mpv-jumpskip/pulls).
