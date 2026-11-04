@@ -23,7 +23,7 @@ OSC by [ModernZ](https://github.com/Samillion/ModernZ)
 All colors are changeable in **`modernz.conf`** or **`uosc.conf`**
 
 -------
-**:white_check_mark: Works with [ani-cli](https://github.com/pystardust/ani-cli)**
+**:white_check_mark: Works with [ani-cli](https://github.com/pystardust/ani-cli) and [Jellyfin MPV Shim](https://github.com/jellyfin/jellyfin-mpv-shim)**
 ------
 
 > [!NOTE]
@@ -229,6 +229,8 @@ chapter_skip_outro=yes
 chapter_skip_recap=yes
 chapter_skip_preview=yes
 # Keyword lists
+# Short keywords (<=3 chars) match entire labels, optionally numbered (OP, ED2, ED 2).
+# Longer keywords match whole words/phrases; punctuation is treated as spaces.
 chapter_skip_keywords_intro=intro,introduction,opening,op,theme,title sequence
 chapter_skip_keywords_outro=ed,ending,outro,credits,end credits,closing
 chapter_skip_keywords_recap=recap,previously

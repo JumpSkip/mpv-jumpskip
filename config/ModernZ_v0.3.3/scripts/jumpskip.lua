@@ -1,6 +1,6 @@
 --[[
     mpv-skip-segment
-    version 2.1
+    version 2.2
     ================
     A Lua script for mpv that detects and skips segments (intros, recaps, outros/credits, previews,
     and movie end-credits/post-credits) using crowdsourced data from TheIntroDB (api.theintrodb.org),
@@ -904,24 +904,25 @@ local function parse_keywords(keyword_str)
     return keywords
 end
 
-local function is_whole_word_match(text, keyword)
-    if #keyword <= 3 then
-        local pattern = "%f[%w]" .. keyword:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1") .. "%f[%W]"
-        return text:lower():match(pattern) ~= nil
-    else
-        return text:lower():find(keyword:lower(), 1, true) ~= nil
-    end
+local function normalize_chapter_title(title)
+    local normalized = title:lower():gsub("[%p]", " "):gsub("%s+", " ")
+    return normalized:match("^%s*(.-)%s*$") or ""
 end
 
 local function chapter_matches_keywords(chapter_title, keywords)
     if not chapter_title or #chapter_title == 0 then return false end
-    local normalized = chapter_title:lower()
-    normalized = normalized:gsub("[%p]", " ")
-    normalized = normalized:gsub("%s+", " ")
-    normalized = normalized:match("^%s*(.-)%s*$") or ""
+    local normalized = normalize_chapter_title(chapter_title)
     for _, kw in ipairs(keywords) do
-        if is_whole_word_match(normalized, kw) then
-            return true
+        local keyword = normalize_chapter_title(kw)
+        if #keyword > 0 then
+            if #keyword <= 3 then
+                if normalized == keyword or (normalized:sub(1, #keyword) == keyword
+                    and normalized:sub(#keyword + 1):match("^ ?%d+$")) then
+                    return true
+                end
+            elseif (" " .. normalized .. " "):find(" " .. keyword .. " ", 1, true) then
+                return true
+            end
         end
     end
     return false
@@ -990,44 +991,32 @@ local function detect_chapter_segments(chapters, duration, existing_segments, me
         local end_time = (i < #sorted_chapters) and sorted_chapters[i + 1].time or duration
         local chapter_duration = end_time - start_time
 
-        if chapter_duration < min_dur or chapter_duration > max_dur then
-            log_debug("chapter-skip: '%s' @%.2fs skipped (dur %.1fs out of bounds)", ch.title, start_time, chapter_duration)
-            goto continue
-        end
-
         local matched = false
         for cat, keywords in pairs(keyword_lists) do
-            if category_enabled[cat] and #keywords > 0 then
-                local normalized = ch.title:lower()
-                normalized = normalized:gsub("[%p]", " ")
-                normalized = normalized:gsub("%s+", " ")
-                normalized = normalized:match("^%s*(.-)%s*$") or ""
-                for _, kw in ipairs(keywords) do
-                    if is_whole_word_match(normalized, kw) then
-                        local overlaps, ratio = check_overlap(start_time, end_time, existing_segments)
-                        if overlaps then
-                            log_debug("chapter-skip: '%s' matches %s but overlaps provider (%.0f%%)", ch.title, cat, ratio * 100)
-                        else
-                            local label = cat:gsub("^%l", string.upper)
-                            if cat == "outro" and media_info and not media_info.is_tv then
-                                label = "Credits"
-                            end
-                            table.insert(detected, make_segment(cat, label, start_time, end_time, "Chapters"))
-                            log_info("Detected %s segment from chapter: '%s' at %.2fs-%.2fs",
-                                cat, ch.title, start_time, end_time)
-                        end
-                        matched = true
-                        break
-                    end
+            if category_enabled[cat] and chapter_matches_keywords(ch.title, keywords) then
+                matched = true
+                if chapter_duration < min_dur or chapter_duration > max_dur then
+                    log_debug("chapter-skip: '%s' matches %s but ignored (dur %.1fs out of bounds)", ch.title, cat, chapter_duration)
+                    break
                 end
-                if matched then break end
+                local overlaps, ratio = check_overlap(start_time, end_time, existing_segments)
+                if overlaps then
+                    log_debug("chapter-skip: '%s' matches %s but overlaps provider (%.0f%%)", ch.title, cat, ratio * 100)
+                else
+                    local label = cat:gsub("^%l", string.upper)
+                    if cat == "outro" and media_info and not media_info.is_tv then
+                        label = "Credits"
+                    end
+                    table.insert(detected, make_segment(cat, label, start_time, end_time, "Chapters"))
+                    log_info("Detected %s segment from chapter: '%s' at %.2fs-%.2fs",
+                        cat, ch.title, start_time, end_time)
+                end
+                break
             end
         end
         if not matched then
             log_debug("chapter-skip: no match for '%s'", ch.title)
         end
-
-        ::continue::
     end
 
     return detected
