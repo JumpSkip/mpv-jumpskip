@@ -1229,8 +1229,10 @@ local function prepare_elements()
         elseif element.type == "slider" then
             --draw static slider parts
             local slider_lo = element.layout.slider
+            element.gap_cache, element.section_cache, element.jumpskip_cache = nil, nil, nil
             -- calculate positions of min and max points
-            element.slider.min.ele_pos = user_opts.seek_handle_size > 0 and (user_opts.seek_handle_size * elem_geo.h / 2) or slider_lo.border
+            element.slider.min.ele_pos = element.name == "persistent_seekbar" and 0
+                or (user_opts.seek_handle_size > 0 and (user_opts.seek_handle_size * elem_geo.h / 2) or slider_lo.border)
             element.slider.max.ele_pos = elem_geo.w - element.slider.min.ele_pos
             element.slider.min.glob_pos = element.hitbox.x1 + element.slider.min.ele_pos
             element.slider.max.glob_pos = element.hitbox.x1 + element.slider.max.ele_pos
@@ -1310,11 +1312,13 @@ local function get_seekbar_handle_pos(element)
 end
 
 -- Prepares elem_ass for a new draw layer with the given color
-local function begin_draw_layer(element, elem_ass, color, anim_override)
+local function begin_draw_layer(element, elem_ass, color, anim_override, clip)
     elem_ass:draw_stop()
     elem_ass:merge(element.style_ass)
     ass_append_alpha(elem_ass, element.layout.alpha, 0, nil, anim_override)
     elem_ass:append("{\\blur0\\bord0\\1c&H" .. osc_color_convert(color) .. "&}")
+    -- Tags must precede the static contours to keep the drawing's alignment.
+    if clip then elem_ass:append(clip) end
     elem_ass:merge(element.static_ass)
 end
 
@@ -1330,187 +1334,166 @@ local function draw_seekbar_handle(element, elem_ass, handle_x, handle_radius, a
     local border_thickness = is_active and user_opts.seek_handle_border_hover_size or user_opts.seek_handle_border_size
     local has_border = border_color and border_color ~= "" and border_thickness > 0
 
+    local function begin_handle_layer(color)
+        begin_draw_layer(element, elem_ass, color, anim_override)
+        -- Enlarged handles can extend past the slider's static bounds. Both
+        -- layers need the same bounds so ASS aligns the ring and fill together.
+        local x1, y1 = handle_x - handle_radius, center_y - handle_radius
+        local x2, y2 = handle_x + handle_radius, center_y + handle_radius
+        elem_ass:rect_cw(x1, y1, x2, y2)
+        elem_ass:rect_ccw(x1, y1, x2, y2)
+    end
+
     if has_border then
         -- inner_radius is how far the fill circle extends inward from the outer edge
-        local inner_radius = handle_radius * (1 - border_thickness)
-        -- full circle in border color, then smaller circle in fill color on top
-        begin_draw_layer(element, elem_ass, border_color, anim_override)
+        local inner_radius = handle_radius * (1 - limit_range(0, 1, border_thickness))
+        -- A hollow ring keeps the border from tinting the fill during fades.
+        begin_handle_layer(border_color)
         ass_draw_cir_cw(elem_ass, handle_x, center_y, handle_radius)
-        begin_draw_layer(element, elem_ass, fill_color, anim_override)
-        ass_draw_cir_cw(elem_ass, handle_x, center_y, inner_radius)
+        if inner_radius > 0 then
+            elem_ass:round_rect_ccw(handle_x - inner_radius, center_y - inner_radius,
+                handle_x + inner_radius, center_y + inner_radius, inner_radius)
+            begin_handle_layer(fill_color)
+            ass_draw_cir_cw(elem_ass, handle_x, center_y, inner_radius)
+        end
     else
         -- no border configured, just draw a single solid circle
-        begin_draw_layer(element, elem_ass, fill_color, anim_override)
+        begin_handle_layer(fill_color)
         ass_draw_cir_cw(elem_ass, handle_x, center_y, handle_radius)
     end
 end
 
 -- Collects and sorts pixel-space cut positions for gap-style chapter markers, skipping the first marker
 local function collect_gap_cuts(element)
+    local cached = element.gap_cache
+    if cached and cached.chapters == state.chapter_list and cached.duration == state.duration then
+        return cached.cuts
+    end
     local cuts = {}
     if element.slider.markerF then
         for n, marker in ipairs(element.slider.markerF()) do
-            if n > 1 and marker >= element.slider.min.value and marker <= element.slider.max.value then
+            if n > 1 and marker > element.slider.min.value and marker < element.slider.max.value then
                 cuts[#cuts + 1] = get_slider_ele_pos_for(element, marker)
             end
         end
         table.sort(cuts)
     end
+    element.gap_cache = {chapters = state.chapter_list, duration = state.duration, cuts = cuts}
     return cuts
 end
 
--- Draws bar segments split around chapter gaps, stopping at x_max (bar_w for bg, xp for fg).
-local function draw_gap_segments(elem_ass, element, gap_half, x_max, slider_lo, elem_geo, radius)
-    gap_half = gap_half or 1.5
-    local cuts = collect_gap_cuts(element)
-    -- clamp x_max back to the nearest gap boundary if it falls inside a gap
-    for _, cut in ipairs(cuts) do
-        if x_max > cut - gap_half and x_max < cut + gap_half then
-            x_max = cut - gap_half
-            break
-        end
+-- Every bar layer uses this contour; only its horizontal coverage changes.
+local function draw_bar_outline(element, ass)
+    local geo, slider = element.layout.geometry, element.layout.slider
+    local height = geo.h - 2 * slider.gap
+    if geo.w <= 0 or height <= 0 then return end
+    local radius = math.max(0, math.min(slider.radius or 0, height / 2, geo.w / 2))
+    ass:round_rect_cw(0, slider.gap, geo.w, geo.h - slider.gap, radius)
+end
+
+local function append_bar_clip_rect(clip, element, x1, x2)
+    local geo = element.layout.geometry
+    local bx, by = get_hitbox_coords(geo.x, geo.y, geo.an, geo.w, geo.h)
+    -- Keep clips outside the contour at the ends, preserving its antialiasing.
+    clip:rect_cw(bx + (x1 == 0 and -1 or x1), by - 1,
+        bx + (x2 == geo.w and geo.w + 1 or x2), by + geo.h + 1)
+end
+
+-- Cache the visible sections between chapter gaps and colored highlights.
+-- Layout preparation invalidates these caches when coordinates/options change.
+local function get_bar_sections(element, excluded)
+    local cuts = element.name == "seekbar" and element.layout.slider.nibbles_style == "gap"
+        and collect_gap_cuts(element) or nil
+    local cached = element.section_cache
+    if cached and cached.cuts == cuts and cached.excluded == excluded then return cached.sections end
+    local holes, sections = {}, {}
+    for _, cut in ipairs(cuts or {}) do holes[#holes + 1] = {cut - 1.5, cut + 1.5} end
+    for _, range in ipairs(excluded or {}) do holes[#holes + 1] = {range[1], range[2]} end
+    table.sort(holes, function(a, b) return a[1] < b[1] end)
+    local start, width = 0, element.layout.geometry.w
+    for _, hole in ipairs(holes) do
+        local left, right = limit_range(0, width, hole[1]), limit_range(0, width, hole[2])
+        if left > start then sections[#sections + 1] = {start, left} end
+        start = math.max(start, right)
     end
-    local seg_start = 0
-    for _, cut in ipairs(cuts) do
-        if cut >= x_max then break end
-        local seg_end = cut - gap_half
-        if seg_end > seg_start then
-            elem_ass:round_rect_cw(seg_start, slider_lo.gap, seg_end, elem_geo.h - slider_lo.gap,
-                (seg_start == 0) and radius or 0, 0)
-        end
-        seg_start = cut + gap_half
-    end
-    if x_max > seg_start then
-        elem_ass:round_rect_cw(seg_start, slider_lo.gap, x_max, elem_geo.h - slider_lo.gap,
-            (seg_start == 0) and radius or 0, (x_max == elem_geo.w) and radius or 0)
+    if start < width then sections[#sections + 1] = {start, width} end
+    element.section_cache = {cuts = cuts, excluded = excluded, sections = sections}
+    return sections
+end
+
+local function append_bar_intersections(clip, element, x1, x2, sections)
+    for _, section in ipairs(sections) do
+        local left, right = math.max(x1, section[1]), math.min(x2, section[2])
+        if right > left then append_bar_clip_rect(clip, element, left, right) end
     end
 end
 
+local function bar_range_clip(element, x1, x2, excluded)
+    local clip = assdraw.ass_new()
+    append_bar_intersections(clip, element, x1, x2, get_bar_sections(element, excluded))
+    if clip.text == "" then return nil end
+    return string.format("{\\clip(%d,%s)}", clip.scale, clip.text)
+end
+
 -- Draws seekbar ranges according to user_opts
-local function draw_seekbar_ranges(element, elem_ass, xp, rh, override_alpha, inverse)
-    local handle = xp and rh and rh > 0
+local function draw_seekbar_ranges(element, elem_ass, xp, rh, override_alpha, inverse, excluded)
     xp = xp or 0
     rh = rh or 0
     local slider_lo = element.layout.slider
     local elem_geo = element.layout.geometry
     local seekRanges = element.slider.seekRangesF()
     if not seekRanges then return end
+    local clip = assdraw.ass_new()
+    local sections = get_bar_sections(element, excluded)
+    for _, range in pairs(seekRanges) do
+        local pstart = math.max(xp + rh, get_slider_ele_pos_for(element, range["start"]) - slider_lo.gap)
+        local pend = range["end"] >= element.slider.max.value and elem_geo.w
+            or get_slider_ele_pos_for(element, range["end"]) + slider_lo.gap
+        append_bar_intersections(clip, element, pstart, pend, sections)
+    end
+    if clip.text == "" then return end
     elem_ass:draw_stop()
     elem_ass:merge(element.style_ass)
     ass_append_alpha(elem_ass, element.layout.alpha, override_alpha or user_opts.seekrangealpha, inverse)
-    elem_ass:append("{\\1c&H" .. osc_color_convert(user_opts.seekbar_cache_color) .. "&}")
+    elem_ass:append("{\\blur0\\bord0\\1c&H" .. osc_color_convert(user_opts.seekbar_cache_color) .. "&}")
+    elem_ass:append(string.format("{\\clip(%d,%s)}", clip.scale, clip.text))
     elem_ass:merge(element.static_ass)
-
-    local radius = slider_lo.radius
-    local gap_half = 1.5
-    local cuts = (slider_lo.nibbles_style == "gap" and element.name == "seekbar") and collect_gap_cuts(element) or {}
-
-    for _, range in pairs(seekRanges) do
-        local pstart = math.max(xp, get_slider_ele_pos_for(element, range["start"]) - slider_lo.gap)
-        local pend = math.min(elem_geo.w, get_slider_ele_pos_for(element, range["end"]) + slider_lo.gap)
-
-        -- round edge only when cache range reaches start/end
-        local r_left = pstart < element.slider.min.ele_pos and radius or 0
-        local r_right = pend > element.slider.max.ele_pos and radius or 0
-
-        -- split around chapter gaps then around the handle
-        local seg_start = pstart
-        for _, cut in ipairs(cuts) do
-            local gap_l, gap_r = cut - gap_half, cut + gap_half
-            if gap_r > pstart and gap_l < pend then
-                local sl, sr = seg_start, math.min(gap_l, pend)
-                if handle and (sl < xp + rh and sr > xp - rh) then
-                    if sl < xp - rh then elem_ass:round_rect_cw(sl, slider_lo.gap, xp - rh, elem_geo.h - slider_lo.gap, sl == pstart and r_left or 0, 0) end
-                    if xp + rh < sr  then elem_ass:round_rect_cw(xp + rh, slider_lo.gap, sr, elem_geo.h - slider_lo.gap, 0, 0) end
-                elseif sr > sl then
-                    elem_ass:round_rect_cw(sl, slider_lo.gap, sr, elem_geo.h - slider_lo.gap, sl == pstart and r_left or 0, 0)
-                end
-                seg_start = math.max(gap_r, pstart)
-            end
-        end
-        local sl, sr = seg_start, pend
-        local rl = (sl == pstart) and r_left or 0
-        if handle and (sl < xp + rh and sr > xp - rh) then
-            if sl < xp - rh then elem_ass:round_rect_cw(sl, slider_lo.gap, xp - rh, elem_geo.h - slider_lo.gap, rl, 0) end
-            if xp + rh < sr  then elem_ass:round_rect_cw(xp + rh, slider_lo.gap, sr, elem_geo.h - slider_lo.gap, 0, r_right) end
-        else
-            if sr > sl then elem_ass:round_rect_cw(sl, slider_lo.gap, sr, elem_geo.h - slider_lo.gap, rl, r_right) end
-        end
-    end
+    draw_bar_outline(element, elem_ass)
 end
 
 -- show visual indicator in seek ranges for ab loop
-local function draw_ab_loop_range(element, elem_ass)
+local function draw_ab_loop_range(element, elem_ass, excluded)
     if element.name ~= "seekbar" then return end
     local ab_a = mp.get_property_number("ab-loop-a")
-    if not state.duration or not ab_a or ab_a < 0 then return end
+    if not state.duration or state.duration <= 0 or not ab_a or ab_a < 0 or ab_a >= state.duration then return end
     local ab_b = mp.get_property_number("ab-loop-b")
-    local slider_lo = element.layout.slider
     local elem_geo = element.layout.geometry
-    local ax = get_slider_ele_pos_for(element, ab_a / state.duration * 100)
-    local bx = (ab_b and ab_b > ab_a and ab_b <= state.duration) and get_slider_ele_pos_for(element, ab_b / state.duration * 100) or elem_geo.w
-    if ax >= bx then return end
-    begin_draw_layer(element, elem_ass, user_opts.ab_loop_color)
-    elem_ass:rect_cw(ax, slider_lo.gap, bx, elem_geo.h - slider_lo.gap)
+    local ax = ab_a == 0 and 0 or get_slider_ele_pos_for(element, ab_a / state.duration * 100)
+    local bx = (ab_b and ab_b > ab_a and ab_b < state.duration) and get_slider_ele_pos_for(element, ab_b / state.duration * 100) or elem_geo.w
+    local clip = bar_range_clip(element, ax, bx, excluded)
+    if not clip then return end
+    begin_draw_layer(element, elem_ass, user_opts.ab_loop_color, nil, clip)
+    draw_bar_outline(element, elem_ass)
 end
 
--- Clamp a pair of corner radii so opposing arcs can never cross.
--- Caps each radius at half the bar's inner height, then scales both down
--- proportionally when the range is narrower than their sum.
-local function fit_corner_radii(r_left, r_right, width, height)
-    local r_max = height / 2
-    if r_left > r_max then r_left = r_max end
-    if r_right > r_max then r_right = r_max end
-    if r_left < 0 then r_left = 0 end
-    if r_right < 0 then r_right = 0 end
-    local total = r_left + r_right
-    if total > width and total > 0 then
-        local k = width / total
-        r_left = r_left * k
-        r_right = r_right * k
+-- Prepare matching masks for highlights and the fills underneath them. ASS
+-- clips use screen coordinates, while the bar's drawing uses local coordinates.
+-- Removing the underlying fills avoids stacked antialiased edges during fades.
+local function prepare_jumpskip_ranges(element)
+    if not element or not element.layout then return {} end
+    local cached = element.jumpskip_cache
+    if cached and cached.segments == state.jumpskip_segments and cached.duration == state.duration then
+        return cached.ranges, cached.clip
     end
-    return r_left, r_right
-end
-
--- Emit a filled range in element-local bar coordinates, rounding only the
--- edges that actually touch an extremity of the bar: outer side round, inner
--- side square, matching the convention used by draw_gap_segments().
-local function draw_bar_range(elem_ass, x1, y1, x2, y2, bar_w, radius)
-    if x2 <= x1 then return end
-    if not radius or radius <= 0 then
-        elem_ass:rect_cw(x1, y1, x2, y2)
-        return
-    end
-    -- Snap to bar boundaries if within corner radius / quantization threshold
-    local eps = math.max(radius, 1.0)
-    local touches_left = x1 <= eps
-    local touches_right = x2 >= bar_w - eps
-    if touches_left then x1 = 0 end
-    if touches_right then x2 = bar_w end
-    if not touches_left and not touches_right then
-        elem_ass:rect_cw(x1, y1, x2, y2)
-        return
-    end
-    local r_left = touches_left and radius or 0
-    local r_right = touches_right and radius or 0
-    r_left, r_right = fit_corner_radii(r_left, r_right, x2 - x1, y2 - y1)
-    elem_ass:round_rect_cw(x1, y1, x2, y2, r_left, r_right)
-end
-
--- draw intro/outro segment highlights published by jumpskip.lua (user-data/jumpskip/segments)
-local function draw_jumpskip_ranges(element, elem_ass)
-    if element.name ~= "seekbar" then return end
+    local ranges = {}
     local segs = state.jumpskip_segments
-    if type(segs) ~= "table" or #segs == 0 or not state.duration or state.duration <= 0 then return end
-    local slider_lo = element.layout.slider
+    cached = {segments = segs, duration = state.duration, ranges = ranges}
+    element.jumpskip_cache = cached
+    if type(segs) ~= "table" or #segs == 0
+        or not state.duration or state.duration <= 0 then return ranges end
     local elem_geo = element.layout.geometry
-    -- Use the same coordinate system as the progress bar (slider.min/max.ele_pos)
-    -- to align segment highlights with the progress fill and chapter gaps,
-    -- avoiding gaps/artifacts caused by seek_handle_size insetting the slider range.
     local bar_w = elem_geo.w
-    local y1 = slider_lo.gap
-    local y2 = elem_geo.h - slider_lo.gap
-    local radius = slider_lo.radius or 0
+    local mask = assdraw.ass_new()
     -- Slider element positions (inset by handle radius when seek_handle_size > 0)
     local min_ele_pos = element.slider.min.ele_pos
     local max_ele_pos = element.slider.max.ele_pos
@@ -1533,10 +1516,7 @@ local function draw_jumpskip_ranges(element, elem_ass)
             -- Map time to slider element position range (same as progress bar's right edge)
             local sx = min_ele_pos + (math.max(0, s) / state.duration) * slider_w
             local ex = min_ele_pos + (math.min(e, state.duration) / state.duration) * slider_w
-            -- For snapped segments at boundaries, align with progress bar visual extent:
-            -- - Intro at t=0: progress bar draws from 0 to min_ele_pos, so segment should start at 0
-            -- - Outro at t=duration: progress bar ends at max_ele_pos, chapter gap at max_ele_pos.
-            --   Extend segment to full bar_w so draw_bar_range applies right radius and meets chapter gap.
+            -- Endpoint segments include the outer caps beyond the handle's range.
             if snapped_start then sx = 0 end
             if snapped_end then ex = bar_w end
             -- Clamp to valid drawing range
@@ -1544,14 +1524,30 @@ local function draw_jumpskip_ranges(element, elem_ass)
             ex = limit_range(0, bar_w, ex)
             if ex > sx then
                 local color = user_opts["jumpskip_" .. tostring(seg.kind) .. "_color"] or user_opts.jumpskip_intro_color
-                begin_draw_layer(element, elem_ass, color)
-                draw_bar_range(elem_ass, sx, y1, ex, y2, bar_w, radius)
+                local clip = assdraw.ass_new()
+                append_bar_clip_rect(clip, element, sx, ex)
+                ranges[#ranges + 1] = {sx, ex, color = color,
+                    clip = string.format("{\\clip(%d,%s)}", clip.scale, clip.text)}
+                mask:merge(clip)
             end
         end
     end
+    if #ranges == 0 then return ranges end
+    cached.clip = string.format("{\\iclip(%d,%s)}", mask.scale, mask.text)
+    return ranges, cached.clip
 end
 
-local function draw_seekbar_nibbles(element, elem_ass)
+-- Crop the full bar silhouette instead of giving each range its own corners.
+-- Even a range narrower than a cap keeps exactly the same outer curve.
+local function draw_jumpskip_ranges(element, elem_ass, ranges)
+    if element.name ~= "seekbar" then return end
+    for _, range in ipairs(ranges) do
+        begin_draw_layer(element, elem_ass, range.color, nil, range.clip)
+        draw_bar_outline(element, elem_ass)
+    end
+end
+
+local function draw_seekbar_nibbles(element, elem_ass, excluded)
     local slider_lo = element.layout.slider
     local elem_geo = element.layout.geometry
 
@@ -1560,14 +1556,16 @@ local function draw_seekbar_nibbles(element, elem_ass)
     end
 
     if slider_lo.nibbles_style == "gap" and element.name == "seekbar" then
-        local radius = slider_lo.radius
+        local clip = bar_range_clip(element, 0, elem_geo.w, excluded)
+        if not clip then return end
         local bg_alpha = 128
         elem_ass:draw_stop()
         elem_ass:merge(element.style_ass)
         ass_append_alpha(elem_ass, element.layout.alpha, bg_alpha)
         elem_ass:append("{\\blur0\\bord0\\1c&H" .. osc_color_convert(user_opts.seekbarbg_color) .. "&}")
+        elem_ass:append(clip)
         elem_ass:merge(element.static_ass)
-        draw_gap_segments(elem_ass, element, 1.5, elem_geo.w, slider_lo, elem_geo, radius)
+        draw_bar_outline(element, elem_ass)
         return
     end
 
@@ -1635,26 +1633,29 @@ local function draw_seekbar_nibbles(element, elem_ass)
 end
 
 -- Draw seekbar progress more accurately
-local function draw_seekbar_progress(element, elem_ass)
+local function draw_seekbar_progress(element, elem_ass, excluded, anim_override, inverse)
     local pos = element.slider.posF()
     if not pos then
         return
     end
-    local xp = get_slider_ele_pos_for(element, pos)
-    local slider_lo = element.layout.slider
-    local elem_geo = element.layout.geometry
-    local radius = slider_lo.radius
-
-    if slider_lo.nibbles_style == "gap" and element.name == "seekbar" then
-        draw_gap_segments(elem_ass, element, 1.5, xp, slider_lo, elem_geo, radius)
-    else
-        elem_ass:round_rect_cw(0, slider_lo.gap, xp, elem_geo.h - slider_lo.gap, radius)
-    end
+    local xp = pos >= element.slider.max.value and element.layout.geometry.w
+        or get_slider_ele_pos_for(element, pos)
+    local clip = bar_range_clip(element, 0, xp, excluded)
+    if not clip then return end
+    elem_ass:draw_stop()
+    elem_ass:merge(element.style_ass)
+    ass_append_alpha(elem_ass, element.layout.alpha, 0, inverse, anim_override)
+    elem_ass:append("{\\blur0\\bord0}")
+    elem_ass:append(clip)
+    elem_ass:merge(element.static_ass)
+    draw_bar_outline(element, elem_ass)
 end
 
 local function render_elements(master_ass, osc_vis, wc_vis)
+    local jumpskip_ranges, jumpskip_clip = prepare_jumpskip_ranges(state.seekbar_element)
     local function render_element(n)
         local element = elements[n]
+        local excluded = element.name == "seekbar" and jumpskip_ranges or nil
 
         -- skip elements whose group is not currently visible
         local is_top = element.layout.group == "top"
@@ -1728,8 +1729,11 @@ local function render_elements(master_ass, osc_vis, wc_vis)
         end
 
         elem_ass:merge(style_ass)
+        if element.name == "seekbarbg" and jumpskip_clip then
+            elem_ass:append(jumpskip_clip)
+        end
 
-        if element.type ~= "button" then
+        if element.type == "box" then
             elem_ass:merge(element.static_ass)
         end
 
@@ -1740,19 +1744,13 @@ local function render_elements(master_ass, osc_vis, wc_vis)
                 local s_min = element.slider.min.value
                 local s_max = element.slider.max.value
 
-                draw_seekbar_nibbles(element, elem_ass)
-
-                -- reset context so handle/progress render on top of nibbles
-                elem_ass:draw_stop()
-                elem_ass:merge(element.style_ass)
-                ass_append_alpha(elem_ass, element.layout.alpha, 0, nil, anim_override)
-                elem_ass:merge(element.static_ass)
+                draw_seekbar_nibbles(element, elem_ass, excluded)
 
                 local handle_x, handle_radius, is_active = get_seekbar_handle_pos(element) -- get handle position/radius
-                draw_seekbar_progress(element, elem_ass)
-                draw_seekbar_ranges(element, elem_ass, handle_x, handle_radius)
-                draw_ab_loop_range(element, elem_ass)
-                draw_jumpskip_ranges(element, elem_ass)
+                draw_seekbar_progress(element, elem_ass, excluded, anim_override)
+                draw_seekbar_ranges(element, elem_ass, handle_x, handle_radius, nil, nil, excluded)
+                draw_ab_loop_range(element, elem_ass, excluded)
+                draw_jumpskip_ranges(element, elem_ass, jumpskip_ranges)
                 draw_seekbar_handle(element, elem_ass, handle_x, handle_radius, anim_override, is_active) -- draw handle on top of progress
 
                 elem_ass:draw_stop()
@@ -1949,20 +1947,14 @@ end
 local function render_persistent_progress(master_ass)
     local element = state.persistent_seekbar_element
     if not element or not element.layout then return end
-    local style_ass = assdraw.ass_new()
-    style_ass:merge(element.style_ass)
     if state.animation or not state.osc_visible then
-        ass_append_alpha(style_ass, element.layout.alpha, 0, true)
-
         local elem_ass = assdraw.ass_new()
-        elem_ass:merge(style_ass)
-        elem_ass:merge(element.static_ass)
 
         -- draw pos marker
         local pos = element.slider.posF and element.slider.posF()
         local xp = pos and get_slider_ele_pos_for(element, pos) or 0
 
-        draw_seekbar_progress(element, elem_ass)
+        draw_seekbar_progress(element, elem_ass, nil, nil, true)
 
         if user_opts.persistent_buffer then
             draw_seekbar_ranges(element, elem_ass, xp, 0, nil, true)
@@ -2311,9 +2303,9 @@ layouts["default"] = function ()
 
     if user_opts.persistent_progress or state.persistent_progress_toggle then
         lo = add_layout("persistent_seekbar")
-        lo.geometry = {x = refX, y = refY, an = 5, w = osc_geo.w, h = user_opts.persistent_progress_height}
+        lo.geometry = {x = refX, y = refY, an = 2, w = osc_geo.w, h = user_opts.persistent_progress_height}
         lo.style = osc_styles.seekbar_fg
-        lo.slider.gap = (seekbar_h - seekbar_bg_h) / 2.0
+        lo.slider.gap = 0
         lo.slider.tooltip_an = 0
     end
 
@@ -2589,9 +2581,9 @@ layouts["compact"] = function ()
 
     if user_opts.persistent_progress or state.persistent_progress_toggle then
         lo = add_layout("persistent_seekbar")
-        lo.geometry = {x = refX, y = refY, an = 5, w = osc_geo.w, h = user_opts.persistent_progress_height}
+        lo.geometry = {x = refX, y = refY, an = 2, w = osc_geo.w, h = user_opts.persistent_progress_height}
         lo.style = osc_styles.seekbar_fg
-        lo.slider.gap = (seekbar_h - seekbar_bg_h) / 2.0
+        lo.slider.gap = 0
         lo.slider.tooltip_an = 0
     end
 
@@ -2798,9 +2790,9 @@ layouts["mini"] = function ()
 
     if user_opts.persistent_progress or state.persistent_progress_toggle then
         lo = add_layout("persistent_seekbar")
-        lo.geometry = {x = refX, y = refY, an = 5, w = osc_geo.w, h = user_opts.persistent_progress_height}
+        lo.geometry = {x = refX, y = refY, an = 2, w = osc_geo.w, h = user_opts.persistent_progress_height}
         lo.style = osc_styles.seekbar_fg
-        lo.slider.gap = (seekbar_h - seekbar_bg_h) / 2.0
+        lo.slider.gap = 0
         lo.slider.tooltip_an = 0
     end
 
@@ -2973,9 +2965,9 @@ layouts["seekbar"] = function ()
 
     if user_opts.persistent_progress or state.persistent_progress_toggle then
         lo = add_layout("persistent_seekbar")
-        lo.geometry = {x = refX, y = refY, an = 5, w = osc_geo.w, h = user_opts.persistent_progress_height}
+        lo.geometry = {x = refX, y = refY, an = 2, w = osc_geo.w, h = user_opts.persistent_progress_height}
         lo.style = osc_styles.seekbar_fg
-        lo.slider.gap = (seekbar_h - seekbar_bg_h) / 2.0
+        lo.slider.gap = 0
         lo.slider.tooltip_an = 0
     end
 
