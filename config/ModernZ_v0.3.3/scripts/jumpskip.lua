@@ -73,6 +73,8 @@ local user_opts = {
     tmdb_api_key         = "",
     request_timeout      = 8,
     keybind              = "Tab",
+    toggle_keybind       = "Ctrl+j",
+    provider_keybind     = "Ctrl+p",
     min_segment_duration = 3.0,
     enable_submission           = true,
     submission_keybind          = "Ctrl+Q",
@@ -111,6 +113,8 @@ local user_opts = {
 local default_opts = {}
 for key, value in pairs(user_opts) do default_opts[key] = value end
 
+local runtime_overrides = { providers = {} }
+
 local function log_info(msg, ...)
     mp.msg.info(string.format(msg, ...))
 end
@@ -131,6 +135,18 @@ local perform_skip
 local toggle_submission_overlay
 local render_submission_overlay
 local close_submission_overlay
+local toggle_enabled
+local cycle_provider
+local check_playback_position
+
+local function update_runtime_keybinds()
+    mp.remove_key_binding("jumpskip_toggle")
+    mp.remove_key_binding("jumpskip_cycle_provider")
+    mp.add_key_binding(user_opts.toggle_keybind ~= "" and user_opts.toggle_keybind or nil,
+        "jumpskip_toggle", function() toggle_enabled() end)
+    mp.add_key_binding(user_opts.provider_keybind ~= "" and user_opts.provider_keybind or nil,
+        "jumpskip_cycle_provider", function() cycle_provider() end)
+end
 
 local function update_keybind()
     if current_bound_key then
@@ -256,9 +272,11 @@ local function load_configuration()
     end
 
     options.read_options(user_opts, "jumpskip")
+    if runtime_overrides.enabled ~= nil then user_opts.enabled = runtime_overrides.enabled end
     validate_options()
     update_keybind()
     update_submission_keybind()
+    update_runtime_keybinds()
     log_info("Configuration active (keybind: %s, auto_skip: %s, tv_priority: %s, movie_priority: %s)%s",
         tostring(user_opts.keybind), tostring(user_opts.auto_skip),
         tostring(user_opts.provider_priority_tvshow), tostring(user_opts.provider_priority_movie),
@@ -1931,6 +1949,10 @@ close_submission_overlay = function()
 end
 
 local function open_submission_overlay()
+    if not user_opts.enabled then
+        mp.osd_message("JumpSkip is disabled", 2)
+        return
+    end
     if not user_opts.enable_submission then
         mp.osd_message("Segment submission is disabled", 2)
         return
@@ -2539,7 +2561,7 @@ local function filter_provider_segments(segs)
     return filtered
 end
 
-local function get_provider_priority(media_info)
+local function get_provider_priority(media_info, configured_only)
 
     local priority_str
     if media_info.is_tv then
@@ -2548,7 +2570,17 @@ local function get_provider_priority(media_info)
         priority_str = user_opts.provider_priority_movie
     end
 
-    return parse_provider_priority(priority_str)
+    local providers = parse_provider_priority(priority_str)
+    if configured_only then return providers end
+    local media_type = media_info.is_tv and 'tvshow' or 'movie'
+    local selected = runtime_overrides.providers[media_type]
+    if selected then
+        for _, name in ipairs(providers) do
+            if name == selected then return {selected} end
+        end
+        runtime_overrides.providers[media_type] = nil
+    end
+    return providers
 end
 
 local function query_segments_pipeline()
@@ -2589,6 +2621,7 @@ local function query_segments_pipeline()
         state.segments_loaded, state.query_in_progress = true, false
         log_segments_summary(final_segs, results)
         publish_segments(final_segs)
+        check_playback_position(mp.get_property_number('time-pos'))
     end
     if #providers == 0 then finish({}); return end
     log_info('Querying segment timestamps from %d provider(s) [%s]: %s...', #providers, media_type, table.concat(providers, ' -> '))
@@ -2755,6 +2788,7 @@ local function show_autoskip_notification(label)
 end
 
 perform_skip = function(is_auto)
+    if not user_opts.enabled then return end
     if not state.active_segment then
         log_debug("perform_skip called but no active segment")
         return
@@ -2815,7 +2849,7 @@ local function should_autoskip(seg_type)
     return user_opts.auto_skip
 end
 
-local function check_playback_position(current_time)
+check_playback_position = function(current_time)
     if not user_opts.enabled or not current_time or not state.segments_loaded then return end
 
     local last = state.last_time
@@ -2984,7 +3018,53 @@ local function reset_state()
         state.overlay.data = ""
         state.overlay:update()
     end
-    pcall(function() mp.del_property("user-data/jumpskip/segments") end)
+    pcall(mp.set_property_native, "user-data/jumpskip/segments", {})
+end
+
+local function refresh_current_segments()
+    local path, filename = state.path, state.filename
+    local duration, media_info = state.duration, state.media_info
+    if state.base_chapter_list ~= nil then
+        mp.set_property_native("chapter-list", state.base_chapter_list)
+    end
+    reset_state()
+    state.path, state.filename = path, filename
+    state.duration, state.media_info = duration, media_info
+    query_segments_pipeline()
+end
+
+toggle_enabled = function()
+    user_opts.enabled = not user_opts.enabled
+    runtime_overrides.enabled = user_opts.enabled
+    refresh_current_segments()
+    local status = user_opts.enabled and "enabled" or "disabled"
+    mp.osd_message("JumpSkip: " .. status, user_opts.osd_message_duration)
+    log_info("JumpSkip %s", status)
+end
+
+cycle_provider = function()
+    if not state.media_info then
+        mp.osd_message("JumpSkip: load an allowed video to switch providers", user_opts.osd_message_duration)
+        return
+    end
+    local media_type = state.media_info.is_tv and 'tvshow' or 'movie'
+    local providers = get_provider_priority(state.media_info, true)
+    if #providers == 0 then
+        mp.osd_message("JumpSkip: no providers configured for " .. media_type, user_opts.osd_message_duration)
+        return
+    end
+    local index = 0
+    for i, name in ipairs(providers) do
+        if name == runtime_overrides.providers[media_type] then index = i; break end
+    end
+    local selected = providers[index + 1]
+    runtime_overrides.providers[media_type] = selected
+    refresh_current_segments()
+    local labels = {theintrodb="TheIntroDB", introdb="IntroDB", skipdb="SkipDB"}
+    local label = selected and labels[selected] or "Auto (configured priority)"
+    if not user_opts.enabled then label = label .. " (script disabled)" end
+    mp.osd_message("JumpSkip provider: " .. label, user_opts.osd_message_duration)
+    log_info("JumpSkip provider [%s]: %s", media_type, label)
 end
 
 local function url_decode(s)
@@ -3152,13 +3232,16 @@ local function on_osd_dimensions_change(_, dim)
 end
 
 mp.register_script_message("skip-segment", perform_skip)
+mp.register_script_message("toggle-jumpskip", toggle_enabled)
+mp.register_script_message("cycle-jumpskip-provider", cycle_provider)
 mp.register_script_message("reload-segments", function()
     log_info("Reloading segment timestamps...")
-    query_segments_pipeline()
+    refresh_current_segments()
 end)
 mp.register_script_message("reload-config", function()
+    runtime_overrides.enabled, runtime_overrides.providers = nil, {}
     load_configuration()
-    if state.path then query_segments_pipeline() end
+    if state.path then refresh_current_segments() end
 end)
 
 mp.observe_property("time-pos",       "number", function(_, cur_time) check_playback_position(cur_time) end)

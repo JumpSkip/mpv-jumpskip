@@ -56,8 +56,10 @@ All colors are changeable in **`modernz.conf`** or **`uosc.conf`**
 - **Chapter-based skipping**:
   - Automatically skips chapters based on title (eg. "OP" or "Outro", "Recap" etc.).
   - Works without configured providers and when media identification fails.
-- **Keyboard Shortcut**:
+- **Keyboard Shortcuts**:
   - Instant skipping via configurable keybind (default: `Tab`).
+  - Enable/disable JumpSkip with `Ctrl+j`.
+  - Cycle between providers with `Ctrl+p`
 - **Configurable Auto-Skip**:
   - Option to automatically skip segments when playback enters them (enabled in jumpskip.conf).
   - Optional countdown timer before auto-skipping, with on-screen visual feedback.
@@ -114,6 +116,7 @@ Create or edit `~~/script-opts/jumpskip.conf`:
 ```ini
 # Master toggle for the script
 enabled=yes
+
 # Directory filter (inclusion & exclusion)
 filter_directories=
 # Auto-skip segments
@@ -124,10 +127,16 @@ auto_skip_countdown=0
 autoskip_types=
 # Countdown to Skip button hiding
 skip_button_timeout=3
-# Keybinding to trigger skip:
-keybind=Tab
 # Minimum segment duration to consider valid:
 min_segment_duration=3.0
+
+# Keyboard shortcuts:
+# Toggle script on/off
+toggle_keybind=Ctrl+j
+# Trigger skip:
+keybind=Tab
+# Cycle providers
+provider_keybind=Ctrl+p
 
 # Segment types to detect and allow skipping:
 skip_intro=yes
