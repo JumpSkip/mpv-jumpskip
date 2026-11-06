@@ -4247,6 +4247,7 @@ end
 mp.register_event("shutdown", function()
     reset_margins()
     mp.del_property("user-data/osc")
+    mp.del_property("user-data/jumpskip/osc-colors")
 end)
 mp.register_event("file-loaded", function()
     is_image() -- check if file is an image
@@ -4573,7 +4574,7 @@ local function validate_user_opts()
         user_opts.windowcontrols_min_hover, user_opts.cache_info_color, user_opts.thumbnail_box_outline, user_opts.nibble_color,
         user_opts.nibble_current_color, user_opts.seek_handle_color, user_opts.ab_loop_color,
         user_opts.jumpskip_intro_color, user_opts.jumpskip_outro_color, user_opts.jumpskip_recap_color, user_opts.jumpskip_preview_color,
-        user_opts.jumpskip_post_credits_color, -- hex-validated alongside the other segment colours
+        user_opts.jumpskip_post_credits_color,
     }
 
     for _, color in pairs(colors) do
@@ -4581,6 +4582,15 @@ local function validate_user_opts()
             msg.warn("'" .. color .. "' is not a valid color")
         end
     end
+
+    local segment_colors = {}
+    for _, kind in ipairs({"intro", "recap", "outro", "preview", "post_credits"}) do
+        local color = user_opts["jumpskip_" .. kind .. "_color"]
+        if color:match("^#%x%x%x%x%x%x$") then
+            segment_colors[kind] = osc_color_convert(color)
+        end
+    end
+    mp.set_property_native("user-data/jumpskip/osc-colors", segment_colors)
 
     state.visibility_modes = {}
     for str in string.gmatch(user_opts.visibility_modes, "([^_]+)") do

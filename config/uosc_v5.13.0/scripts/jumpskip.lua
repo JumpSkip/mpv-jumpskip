@@ -86,6 +86,7 @@ local user_opts = {
     button_height        = 56,
     button_font_size     = 24,
     button_font          = "mpv-osd",
+    button_color_by_segment = false,
     accent_color         = "E75C6C",
     bg_color             = "0A0A0A",
     text_color           = "FFFFFF",
@@ -2640,6 +2641,25 @@ local function update_button_coordinates()
     state.box.y2 = y2
 end
 
+local default_segment_colors = {
+    intro = "8416FF", recap = "FF7F2B", outro = "FF46AD",
+    preview = "A7BB00", post_credits = "A7BB00",
+}
+
+local function skip_button_accent(seg)
+    if not user_opts.button_color_by_segment then return user_opts.accent_color end
+    local colors = mp.get_property_native("user-data/jumpskip/osc-colors")
+    if type(colors) == "table" then
+        local kind = seg.type
+        if kind == "outro" and state.media_info and not state.media_info.is_tv and colors.credits then
+            kind = "credits"
+        end
+        local color = colors[kind]
+        if type(color) == "string" and color:match("^%x%x%x%x%x%x$") then return color end
+    end
+    return default_segment_colors[seg.type] or user_opts.accent_color
+end
+
 local function render_skip_button()
     if not state.button_visible or not state.active_segment then
         if state.overlay then
@@ -2656,6 +2676,7 @@ local function render_skip_button()
     update_button_coordinates()
 
     local seg      = state.active_segment
+    local accent   = skip_button_accent(seg)
     local scale    = state.display_h / 1080.0
     local x1, y1, x2, y2 = state.box.x1, state.box.y1, state.box.x2, state.box.y2
     local center_x = round((x1 + x2) / 2)
@@ -2672,14 +2693,14 @@ local function render_skip_button()
 
     ass:new_event()
     ass:append(string.format("{\\pos(0,0)\\rDefault\\an7\\blur%d\\bord0\\1c&H%s&\\1a&H%02X&}",
-        round(8 * scale), user_opts.accent_color, opacity_to_alpha(glow_opacity)))
+        round(8 * scale), accent, opacity_to_alpha(glow_opacity)))
     ass:draw_start()
     ass:round_rect_cw(x1 - (3 * scale), y1 - (3 * scale), x2 + (3 * scale), y2 + (3 * scale), radius + (2 * scale))
     ass:draw_stop()
 
     ass:new_event()
     ass:append(string.format("{\\pos(0,0)\\rDefault\\an7\\blur0\\bord%d\\1c&H%s&\\1a&H%02X&\\3c&H%s&\\3a&H%s&}",
-        border_width, user_opts.bg_color, opacity_to_alpha(bg_opacity), user_opts.accent_color, border_alpha))
+        border_width, user_opts.bg_color, opacity_to_alpha(bg_opacity), accent, border_alpha))
     ass:draw_start()
     ass:round_rect_cw(x1, y1, x2, y2, radius)
     ass:draw_stop()
@@ -3143,6 +3164,9 @@ end)
 mp.observe_property("time-pos",       "number", function(_, cur_time) check_playback_position(cur_time) end)
 mp.observe_property("osd-dimensions", "native", on_osd_dimensions_change)
 mp.observe_property("mouse-pos",      "native", on_mouse_pos)
+mp.observe_property("user-data/jumpskip/osc-colors", "native", function()
+    if user_opts.button_color_by_segment and state.button_visible then render_skip_button() end
+end)
 
 mp.register_event("file-loaded", on_file_loaded)
 mp.register_event("end-file",    on_end_file)

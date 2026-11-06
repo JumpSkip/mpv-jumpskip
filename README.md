@@ -49,7 +49,7 @@ All colors are changeable in **`modernz.conf`** or **`uosc.conf`**
   - Show skippable segments types directly in the seekbar with diffrent customizable colors `script-opts/modernz.conf` or `script-opts/uosc.conf`.
   - Requires modified [ModernZ](https://github.com/JumpSkip/mpv-jumpskip/wiki/Colored-Segments) or [uosc](https://github.com/JumpSkip/mpv-jumpskip/wiki/Colored-Segments)
 - **Interactive On-Screen Clickable Button**:
-  - Semi-transparent vector card (ASS overlay) (`Skip Intro ▶`, `Skip Outro ▶`, etc.).
+  - Semi-transparent customisable vector card (ASS overlay) (`Skip Intro ▶`, `Skip Outro ▶`, etc.).
 - **Interactive On-Screen Clickable Timestamps Submission Interface**:
   - An interactive interface letting you submit timestamps directly from within mpv, eliminating the need for manual data entry (default: `Ctrl+q`). [Preview](https://github.com/user-attachments/assets/bd35cd66-1388-40ff-aea6-eedd2dd0e963)
   - Requires a provider API key.
@@ -200,6 +200,7 @@ accent_color=5ba3f0
 bg_color=0A0A0A
 text_color=FFFFFF
 hint_color=AAAAAA
+button_color_by_segment=yes
 
 # OSD message upon skipping:
 show_osd_message=yes

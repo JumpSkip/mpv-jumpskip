@@ -233,6 +233,21 @@ config = {
 	timeline_step = 5,
 	timeline_step_flag = '',
 }
+do
+	local ranges = config.chapter_ranges
+	local segment_ranges = {
+		intro = ranges.intros or ranges.openings,
+		recap = ranges.recaps,
+		outro = ranges.outros or ranges.endings,
+		credits = ranges.credits or ranges.outros or ranges.endings,
+		preview = ranges.previews,
+		post_credits = ranges.post_credits,
+	}
+	local colors = {}
+	for kind, range in pairs(segment_ranges) do colors[kind] = range.color end
+	mp.set_property_native('user-data/jumpskip/osc-colors', colors)
+	mp.register_event('shutdown', function() mp.del_property('user-data/jumpskip/osc-colors') end)
+end
 
 function update_load_types()
 	local extensions = {}
