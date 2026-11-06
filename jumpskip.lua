@@ -65,6 +65,7 @@ local user_opts = {
     default_chapter_title = "Chapter",
     start_offset         = 0.0,
     end_offset           = 0.0,
+    outro_end_gap        = 5.0,
     provider_priority_tvshow = "",
     provider_priority_movie = "",
     merge_providers      = true,
@@ -231,6 +232,13 @@ local function validate_options()
     end
     if timeout < 0 then timeout = 0 end
     user_opts.skip_button_timeout = timeout
+
+    local gap = tonumber(user_opts.outro_end_gap)
+    if not gap or gap ~= gap or gap < 0 or gap == math.huge then
+        log_warn("Invalid outro_end_gap value '%s'; using 0 (disabled)", tostring(user_opts.outro_end_gap))
+        gap = 0
+    end
+    user_opts.outro_end_gap = gap
 end
 
 local function load_configuration()
@@ -2358,6 +2366,30 @@ local function merge_segment_lists(primary, secondary)
     return result
 end
 
+local function fill_outro_end_gap(segments, duration)
+    local max_gap = tonumber(user_opts.outro_end_gap) or 0
+    duration = tonumber(duration) or 0
+    if not (max_gap > 0 and max_gap < math.huge and duration > 0 and duration < math.huge) then return end
+    for index, seg in ipairs(segments) do
+        local end_sec = tonumber(seg.end_sec)
+        local gap = end_sec and (duration - end_sec) or 0
+        if seg.type == 'outro' and gap > 0 and gap <= max_gap then
+            local occupied = false
+            for _, other in ipairs(segments) do
+                if other ~= seg and other.start_sec < duration and other.end_sec > end_sec then
+                    occupied = true
+                    break
+                end
+            end
+            if not occupied then
+                local extended = copy_table(seg)
+                extended.end_sec = duration
+                segments[index] = extended
+            end
+        end
+    end
+end
+
 local function segment_marker_enabled(seg_type)
     if not user_opts.show_colored_segments then return false end
     local per_type = user_opts["show_colored_" .. tostring(seg_type) .. "_segments"]
@@ -2720,6 +2752,7 @@ local function query_segments_pipeline(job, allow_cached)
             local derived = detect_chapter_segments(chapters, state.duration, final_segs, media_info)
             for _, segment in ipairs(derived) do final_segs[#final_segs + 1] = segment end
         end
+        fill_outro_end_gap(final_segs, state.duration)
         table.sort(final_segs, function(a, b) return a.start_sec < b.start_sec end)
         state.media_info, state.segments = media_info, final_segs
         state.segments_loaded, state.query_in_progress = true, false

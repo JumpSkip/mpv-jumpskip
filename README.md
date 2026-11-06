@@ -67,12 +67,7 @@ All colors are changeable in **`modernz.conf`** or **`uosc.conf`**
   - Title-to-ID fallback lookup via Cinemeta or optional TMDb API
   - Reads embedded file metadata tags and parses filenames and folder paths for IMDb IDs.
 - **Playlist Prefetching**:
-  - After the current file is ready, resolves titles and available IMDb/TMDb/TVDB IDs and fetches segments for the remaining playlist entries, one video at a time.
-  - Reuses completed lookups during the current mpv session; playback changes take priority over background requests, and playlist edits update the queue.
-  - Uses filenames, folder hints, and playlist titles before playback. Embedded metadata and chapters are checked when each file opens; duration-sensitive providers are refreshed when its actual runtime becomes available.
-  - If a refresh fails (for example, while offline), keeps that provider's prefetched segments and merges them using the configured priority. Failed refreshes preserve the cache and can retry on a later load.
-  - Background console output is limited to `Prefetching playlist: 1/N` and `Prefetching playlist complete: N/N`, counting the current video plus the remaining playlist entries.
-  - Enabled by default; set `playlist_prefetch=no` to disable. Directory filters and provider settings also apply to prefetching. `reload-segments` clears the cache and retries lookups.
+  - After the current file is ready, resolves titles and fetches segments for the remaining playlist entries.
 - **Fully Configurable**:
   - Fine-tune timing offsets, segment toggles, provider priorities, timeouts, colors, and button positions via `script-opts/jumpskip.conf`.
 ---
@@ -123,8 +118,7 @@ Create or edit `~~/script-opts/jumpskip.conf`:
 ```ini
 # Master toggle for the script
 enabled=yes
-
-# Prefetch metadata and segments for upcoming playlist entries
+# Prefetch segments for current playlist
 playlist_prefetch=yes
 
 # Directory filter (inclusion & exclusion)
@@ -190,6 +184,8 @@ skipdb_preview_segment=yes
 # Timing offsets (in seconds):
 start_offset=0.0
 end_offset=0.0
+# Extend outro to fill a empty gap.
+outro_end_gap=5.0
 # Merge providers:
 merge_providers=yes
 

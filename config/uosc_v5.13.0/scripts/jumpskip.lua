@@ -65,6 +65,7 @@ local user_opts = {
     default_chapter_title = "Chapter",
     start_offset         = 0.0,
     end_offset           = 0.0,
+    outro_end_gap        = 5.0,
     provider_priority_tvshow = "",
     provider_priority_movie = "",
     merge_providers      = true,
@@ -231,6 +232,13 @@ local function validate_options()
     end
     if timeout < 0 then timeout = 0 end
     user_opts.skip_button_timeout = timeout
+
+    local gap = tonumber(user_opts.outro_end_gap)
+    if not gap or gap ~= gap or gap < 0 or gap == math.huge then
+        log_warn("Invalid outro_end_gap value '%s'; using 0 (disabled)", tostring(user_opts.outro_end_gap))
+        gap = 0
+    end
+    user_opts.outro_end_gap = gap
 end
 
 local function load_configuration()
@@ -1094,8 +1102,6 @@ local state = {
     submission_mbtn_bound = false,
 }
 
--- Only completed playlist lookups survive a file change. Playback state and
--- chapter data always belong to the currently loaded file.
 local playlist_prefetch = {cache = {}}
 
 local function copy_table(value)
@@ -2360,6 +2366,30 @@ local function merge_segment_lists(primary, secondary)
     return result
 end
 
+local function fill_outro_end_gap(segments, duration)
+    local max_gap = tonumber(user_opts.outro_end_gap) or 0
+    duration = tonumber(duration) or 0
+    if not (max_gap > 0 and max_gap < math.huge and duration > 0 and duration < math.huge) then return end
+    for index, seg in ipairs(segments) do
+        local end_sec = tonumber(seg.end_sec)
+        local gap = end_sec and (duration - end_sec) or 0
+        if seg.type == 'outro' and gap > 0 and gap <= max_gap then
+            local occupied = false
+            for _, other in ipairs(segments) do
+                if other ~= seg and other.start_sec < duration and other.end_sec > end_sec then
+                    occupied = true
+                    break
+                end
+            end
+            if not occupied then
+                local extended = copy_table(seg)
+                extended.end_sec = duration
+                segments[index] = extended
+            end
+        end
+    end
+end
+
 local function segment_marker_enabled(seg_type)
     if not user_opts.show_colored_segments then return false end
     local per_type = user_opts["show_colored_" .. tostring(seg_type) .. "_segments"]
@@ -2722,6 +2752,7 @@ local function query_segments_pipeline(job, allow_cached)
             local derived = detect_chapter_segments(chapters, state.duration, final_segs, media_info)
             for _, segment in ipairs(derived) do final_segs[#final_segs + 1] = segment end
         end
+        fill_outro_end_gap(final_segs, state.duration)
         table.sort(final_segs, function(a, b) return a.start_sec < b.start_sec end)
         state.media_info, state.segments = media_info, final_segs
         state.segments_loaded, state.query_in_progress = true, false
@@ -2751,16 +2782,12 @@ local function query_segments_pipeline(job, allow_cached)
                     ok, segs, err = true, copy_table(result.segs), nil
                     response_duration = cached_duration
                 end
-                -- Keep each provider's original runtime on fallback. A failed
-                -- refresh must not prevent another attempt on a later load.
                 results[idx] = {name=name, ok=ok, segs=ok and segs and filter_provider_segments(segs, context) or {},
                     err=err, duration=response_duration}
                 pending = pending - 1
                 if pending == 0 then finish(results) end
             end
             local query = provider_fns[name]
-            -- Duration-sensitive providers must see the loaded file's runtime;
-            -- keep their prefetched segments if that refresh fails offline.
             local duration_matches = result and (name == 'introdb' or cached_duration == context.duration)
             if result and result.ok and duration_matches then
                 response_duration = cached_duration
@@ -3342,7 +3369,6 @@ end
 function playlist_prefetch.schedule()
     if not user_opts.enabled or not user_opts.playlist_prefetch or not state.prefetch_ready
         or state.query_in_progress or playlist_prefetch.active or playlist_prefetch.timer then return end
-    -- Yield between entries, including synchronous cache hits and failures.
     playlist_prefetch.timer = mp.add_timeout(0.1, function()
         playlist_prefetch.timer = nil
         playlist_prefetch.sync_options()
@@ -3373,8 +3399,6 @@ function playlist_prefetch.schedule()
             local path = entry.filename
             local key = playlist_prefetch.key(path)
             if key and is_directory_allowed(path, context) then
-                -- Never read the playing file's metadata, title, or chapters
-                -- when identifying a different playlist entry.
                 local info = TitleParser.extract_media_metadata(path, path, entry.title or '', {})
                 local signature = playlist_prefetch.signature(info)
                 local cached = playlist_prefetch.cache[key .. '\0' .. signature]
@@ -3396,8 +3420,6 @@ function playlist_prefetch.schedule()
 end
 
 local function on_playlist_changed()
-    -- Re-read the queue after edits so removed/reordered items cannot keep an
-    -- obsolete queue alive. Completed lookups remain reusable by path.
     playlist_prefetch.stop(true)
     playlist_prefetch.schedule()
 end
