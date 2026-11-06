@@ -1,6 +1,6 @@
 --[[
     mpv-skip-segment
-    version 2.2
+    version 2.3
     ================
     A Lua script for mpv that detects and skips segments (intros, recaps, outros/credits, previews,
     and movie end-credits/post-credits) using crowdsourced data from TheIntroDB (api.theintrodb.org),
@@ -29,6 +29,7 @@ local options = require 'mp.options'
 
 local user_opts = {
     enabled              = true,
+    playlist_prefetch    = true,
     auto_skip            = false,
     auto_skip_countdown  = 0,
     autoskip_types       = "",
@@ -127,6 +128,12 @@ local function log_debug(msg, ...)
     if user_opts.debug_mode then
         mp.msg.info("[DEBUG] " .. string.format(msg, ...))
     end
+end
+
+local function log_request(context, level, msg, ...)
+    if context and context.quiet then return end
+    if level == 'debug' then log_debug(msg, ...)
+    else log_info(msg, ...) end
 end
 
 local current_bound_key = nil
@@ -1087,6 +1094,35 @@ local state = {
     submission_mbtn_bound = false,
 }
 
+local playlist_prefetch = {cache = {}}
+
+local function copy_table(value)
+    if type(value) ~= 'table' then return value end
+    local copy = {}
+    for key, item in pairs(value) do copy[key] = copy_table(item) end
+    return copy
+end
+
+local function cancel_requests(context)
+    if not context then return end
+    context.cancelled = true
+    local requests = context.requests or {}
+    context.requests = {}
+    for id in pairs(requests) do
+        if mp.abort_async_command then pcall(mp.abort_async_command, id) end
+    end
+end
+
+function playlist_prefetch.stop(keep_progress)
+    if playlist_prefetch.timer then playlist_prefetch.timer:kill() end
+    playlist_prefetch.timer = nil
+    cancel_requests(playlist_prefetch.active)
+    playlist_prefetch.active = nil
+    if not keep_progress then
+        playlist_prefetch.progress_key, playlist_prefetch.progress_complete = nil, false
+    end
+end
+
 local function extract_media_metadata()
     local path            = mp.get_property("path") or ""
     local filename        = mp.get_property("filename") or ""
@@ -1112,7 +1148,8 @@ local function redact_http_secrets(value)
     end)
 end
 
-local function async_http_request(method, url, headers, data, timeout_sec, callback)
+local function async_http_request(method, url, headers, data, timeout_sec, callback, context)
+    if context and context.cancelled then return end
     local json_data
     if method == 'POST' then
         local err
@@ -1134,17 +1171,19 @@ local function async_http_request(method, url, headers, data, timeout_sec, callb
         args[#args + 1], args[#args + 2] = '-H', header
     end
     args[#args + 1] = url
-    log_debug('HTTP %s: %s', method, redact_http_secrets(url))
+    log_request(context, 'debug', 'HTTP %s: %s', method, redact_http_secrets(url))
 
-    local completed_once = false
+    local completed_once, request_id = false, nil
     local function completed(success, res, err)
         if completed_once then return end
         completed_once = true
+        if context and request_id then context.requests[request_id] = nil end
         local code = tonumber(res and res.stdout and res.stdout:match('(%d%d%d)%s*$')) or 0
         local body = ''
         local f = io.open(body_file, 'rb')
         if f then body = f:read('*a') or ''; f:close() end
         os.remove(body_file)
+        if context and context.cancelled then return end
         if not success or not res or res.status ~= 0 then
             local message = res and ('curl error (exit code ' .. tostring(res.status) .. '): ' .. (res.stderr or ''))
                 or err or 'curl execution failed'
@@ -1163,31 +1202,36 @@ local function async_http_request(method, url, headers, data, timeout_sec, callb
             callback(true, parsed, nil, code)
         end
     end
-    local ok, request_id = pcall(mp.command_native_async, {
+    local ok, launched_id = pcall(mp.command_native_async, {
         name='subprocess', args=args, capture_stdout=true, capture_stderr=true, playback_only=false,
     }, completed)
+    request_id = launched_id
     if not ok then
         os.remove(body_file)
         if completed_once then error(request_id) end
         completed_once = true
         callback(false, nil, redact_http_secrets(request_id), 0)
+    elseif context and not completed_once then
+        context.requests = context.requests or {}
+        context.requests[request_id] = true
     end
+    return ok and request_id or nil
 end
 
-local function async_http_get(url, headers, timeout_sec, callback)
-    return async_http_request('GET', url, headers, nil, timeout_sec, callback)
+local function async_http_get(url, headers, timeout_sec, callback, context)
+    return async_http_request('GET', url, headers, nil, timeout_sec, callback, context)
 end
 
 local function async_http_post(url, headers, data, timeout_sec, callback)
     return async_http_request('POST', url, headers, data, timeout_sec, callback)
 end
 
-local function resolve_title_to_imdb(media_info, current_file_id, callback)
+local function resolve_title_to_imdb(media_info, current_file_id, callback, context)
     local function request(url, done)
         async_http_get(url, nil, 6, function(ok, data)
-            if state.file_id ~= current_file_id then return end
+            if state.file_id ~= current_file_id or (context and context.cancelled) then return end
             done(ok and type(data) == 'table', type(data) == 'table' and data or nil)
-        end)
+        end, context)
     end
     local function has_id()
         return media_info.imdb_id ~= nil or media_info.tmdb_id ~= nil or media_info.tvdb_id ~= nil
@@ -1200,7 +1244,7 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback)
         request('https://v3-cinemeta.strem.io/meta/series/' .. id .. '.json', function(ok, data)
             local valid = ok and data and type(data.meta) == 'table'
                 and TitleParser.validate_series_seasons(data.meta.videos, media_info)
-            if not valid then log_info("Could not establish a unique season for '%s'", media_info.title or id) end
+            if not valid then log_request(context, 'info', "Could not establish a unique season for '%s'", media_info.title or id) end
             done(valid == true)
         end)
     end
@@ -1209,7 +1253,7 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback)
         return
     end
     if media_info.year_ambiguous then
-        log_info('Filename contains conflicting years; rejecting title resolution')
+        log_request(context, 'info', 'Filename contains conflicting years; rejecting title resolution')
         callback(false)
         return
     end
@@ -1220,7 +1264,7 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback)
             if media_info.is_tv then score = TitleParser.score_series_candidate(candidate, query, year, candidates)
             else score = TitleParser.score_movie_candidate(candidate, query, year, candidates) end
             score = score - (rank - 1) * 0.5
-            log_debug("Title candidate #%d '%s' score=%.1f", rank, type(candidate) == 'table' and candidate.name or '', score)
+            log_request(context, 'debug', "Title candidate #%d '%s' score=%.1f", rank, type(candidate) == 'table' and candidate.name or '', score)
             if score > best_score then best, best_score = candidate, score end
         end
         if best_score >= 300 then return best, best_score end
@@ -1247,7 +1291,7 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback)
                 if not valid then callback(false); return end
                 media_info.imdb_id = id
                 accept_query(query)
-                log_info("Resolved '%s' to IMDb ID %s via Cinemeta (score=%.1f)", media_info.title, id, score)
+                log_request(context, 'info', "Resolved '%s' to IMDb ID %s via Cinemeta (score=%.1f)", media_info.title, id, score)
                 callback(true)
             end)
         end)
@@ -1265,14 +1309,14 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback)
                     media_info.imdb_id = imdb_id(data.imdb_id)
                     media_info.tvdb_id = media_info.tvdb_id or integer(data.tvdb_id, 1)
                 end
-                log_info("Resolved '%s' to TMDb ID %d", media_info.title or '?', id)
+                log_request(context, 'info', "Resolved '%s' to TMDb ID %d", media_info.title or '?', id)
                 callback(true)
             end)
         end
         if not media_info.is_tv or not media_info.season_missing then fetch_external_ids(); return end
         request(string.format('https://api.themoviedb.org/3/tv/%d?api_key=%s', id, api_key), function(ok, data)
             if not ok or not data or tonumber(data.number_of_seasons) ~= 1 then
-                log_info("Could not establish a unique season for '%s'", media_info.title or '?')
+                log_request(context, 'info', "Could not establish a unique season for '%s'", media_info.title or '?')
                 callback(false)
                 return
             end
@@ -1316,7 +1360,8 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback)
     search_tmdb()
 end
 
-local function query_theintrodb(media_info, current_file_id, callback)
+local function query_theintrodb(media_info, current_file_id, callback, context)
+    local duration = context and context.duration or state.duration
     if not media_info.tvdb_id and not media_info.tmdb_id and not media_info.imdb_id then
         callback(false, nil, "Missing ID (tvdb_id, tmdb_id, or imdb_id)")
         return
@@ -1339,17 +1384,17 @@ local function query_theintrodb(media_info, current_file_id, callback)
         table.insert(params, "season="  .. tostring(media_info.season))
         table.insert(params, "episode=" .. tostring(media_info.episode))
     end
-    if state.duration and state.duration > 0 then
-        table.insert(params, "duration_ms=" .. tostring(round(state.duration * 1000)))
+    if duration and duration > 0 then
+        table.insert(params, "duration_ms=" .. tostring(round(duration * 1000)))
     end
 
     local url     = "https://api.theintrodb.org/v4/media?" .. table.concat(params, "&")
     local headers = build_auth_header(user_opts.theintrodb_api_key, "Authorization: Bearer ")
 
     async_http_get(url, headers, user_opts.request_timeout, function(success, data, err, http_code)
-        if state.file_id ~= current_file_id then return end
+        if state.file_id ~= current_file_id or (context and context.cancelled) then return end
         if http_code == 404 then
-            log_info("TheIntroDB returned 0 segment(s)")
+            log_request(context, 'info', "TheIntroDB returned 0 segment(s)")
             callback(true, {}, nil)
             return
         end
@@ -1378,7 +1423,7 @@ local function query_theintrodb(media_info, current_file_id, callback)
 
                 if not is_no_segment then
                     local s_sec = s_ms and (s_ms / 1000.0) or 0.0
-                    local e_sec = e_ms and (e_ms / 1000.0) or (state.duration > 0 and state.duration or nil)
+                    local e_sec = e_ms and (e_ms / 1000.0) or (duration > 0 and duration or nil)
                     if e_sec and (e_sec - s_sec) >= user_opts.min_segment_duration then
                         table.insert(normalized, make_segment(seg_type, label, s_sec, e_sec, "TheIntroDB"))
                     end
@@ -1392,12 +1437,12 @@ local function query_theintrodb(media_info, current_file_id, callback)
         if user_opts.skip_outro   and user_opts.theintrodb_outro_segment   then add_ranges(data.credits,  "outro",   outro_label)   end
         if user_opts.skip_preview and user_opts.theintrodb_preview_segment then add_ranges(data.preview,  "preview", "Preview")     end
 
-        log_info("TheIntroDB returned %d segment(s)", #normalized)
+        log_request(context, 'info', "TheIntroDB returned %d segment(s)", #normalized)
         callback(true, normalized, nil)
-    end)
+    end, context)
 end
 
-local function query_introdb(media_info, current_file_id, callback)
+local function query_introdb(media_info, current_file_id, callback, context)
     if not media_info.imdb_id then
         callback(false, nil, "IntroDB requires imdb_id")
         return
@@ -1420,7 +1465,7 @@ local function query_introdb(media_info, current_file_id, callback)
     local headers = build_auth_header(user_opts.introdb_api_key, "X-API-Key: ")
 
     async_http_get(url, headers, user_opts.request_timeout, function(success, data, err)
-        if state.file_id ~= current_file_id then return end
+        if state.file_id ~= current_file_id or (context and context.cancelled) then return end
         if not success or not data then
             callback(false, nil, err or "IntroDB request failed")
             return
@@ -1450,12 +1495,13 @@ local function query_introdb(media_info, current_file_id, callback)
             add_segment(data.post_credits, "post_credits", "Post-Credits")
         end
 
-        log_info("IntroDB returned %d segment(s)", #normalized)
+        log_request(context, 'info', "IntroDB returned %d segment(s)", #normalized)
         callback(true, normalized, nil)
-    end)
+    end, context)
 end
 
-local function query_skipdb(media_info, current_file_id, callback)
+local function query_skipdb(media_info, current_file_id, callback, context)
+    local duration = context and context.duration or state.duration
     if not media_info.imdb_id then
         callback(false, nil, "SkipDB requires imdb_id")
         return
@@ -1471,14 +1517,14 @@ local function query_skipdb(media_info, current_file_id, callback)
         url = url .. "&season="  .. tostring(media_info.season)
                   .. "&episode=" .. tostring(media_info.episode)
     end
-    if state.duration and state.duration > 0 then
-        url = url .. "&duration=" .. tostring(math.floor(state.duration))
+    if duration and duration > 0 then
+        url = url .. "&duration=" .. tostring(math.floor(duration))
     end
 
     local headers = build_auth_header(user_opts.skipdb_api_key, "Authorization: Bearer ")
 
     async_http_get(url, headers, user_opts.request_timeout, function(success, data, err)
-        if state.file_id ~= current_file_id then return end
+        if state.file_id ~= current_file_id or (context and context.cancelled) then return end
         if not success or not data then
             callback(false, nil, err or "SkipDB request failed")
             return
@@ -1511,9 +1557,9 @@ local function query_skipdb(media_info, current_file_id, callback)
         if user_opts.skip_outro   then add_segment(segs.outro,   "outro",   "Outro")   end
         if user_opts.skip_preview then add_segment(segs.preview, "preview", "Preview") end
 
-        log_info("SkipDB returned %d segment(s)", #normalized)
+        log_request(context, 'info', "SkipDB returned %d segment(s)", #normalized)
         callback(true, normalized, nil)
-    end)
+    end, context)
 end
 
 local provider_fns = {
@@ -2536,24 +2582,24 @@ local function publish_segments(segments)
     end
 end
 
-local function provider_segment_allowed(provider, seg_type)
+local function provider_segment_allowed(provider, seg_type, context)
     if not provider or not seg_type then return true end
     local key = tostring(provider):lower() .. '_' .. tostring(seg_type):lower() .. '_segment'
     local enabled = user_opts[key]
     if enabled == nil then
-        log_debug('No per-provider toggle %s (unknown provider or segment type); allowing segment', key)
+        log_request(context, 'debug', 'No per-provider toggle %s (unknown provider or segment type); allowing segment', key)
         return true
     end
     return enabled == true
 end
 
-local function filter_provider_segments(segs)
+local function filter_provider_segments(segs, context)
     local filtered = {}
     for _, seg in ipairs(segs) do
-        if provider_segment_allowed(seg.provider, seg.type) then
+        if provider_segment_allowed(seg.provider, seg.type, context) then
             table.insert(filtered, seg)
         else
-            log_info('Dropping %s segment from %s (disabled via %s_%s_segment=no)',
+            log_request(context, 'info', 'Dropping %s segment from %s (disabled via %s_%s_segment=no)',
                 tostring(seg.type), tostring(seg.provider),
                 tostring(seg.provider):lower(), tostring(seg.type):lower())
         end
@@ -2583,27 +2629,85 @@ local function get_provider_priority(media_info, configured_only)
     return providers
 end
 
-local function query_segments_pipeline()
-    state.query_id = (state.query_id or 0) + 1
-    local current_query_id, current_file_id = state.query_id, state.file_id
-    state.query_in_progress = false
-    if not user_opts.enabled or not state.media_info then return end
-
-    local media_info = {}
-    for key, value in pairs(state.media_info) do media_info[key] = value end
-    local function is_current()
-        return state.file_id == current_file_id and state.query_id == current_query_id
+function playlist_prefetch.key(path)
+    if not path or path == '' then return nil end
+    if not is_url(path) then
+        local ok, normalized = pcall(mp.command_native, {'normalize-path', path})
+        if ok and type(normalized) == 'string' then return normalized end
     end
-    state.query_in_progress, state.segments_loaded = true, false
-    state.segments = {}
+    return path
+end
+
+function playlist_prefetch.signature(info)
+    local values = {}
+    for _, field in ipairs({'title', 'title_with_year', 'year', 'year_ambiguous',
+        'is_tv', 'season', 'episode', 'season_missing', 'imdb_id', 'tmdb_id', 'tvdb_id'}) do
+        values[#values + 1] = tostring(info[field])
+    end
+    return utils.format_json(values)
+end
+
+function playlist_prefetch.sync_options()
+    local keys, values = {}, {}
+    for key in pairs(default_opts) do keys[#keys + 1] = key end
+    table.sort(keys)
+    for _, key in ipairs(keys) do values[#values + 1] = tostring(user_opts[key]) end
+    values[#values + 1] = tostring(runtime_overrides.providers.tvshow)
+    values[#values + 1] = tostring(runtime_overrides.providers.movie)
+    local signature = utils.format_json(values)
+    if playlist_prefetch.options ~= signature then
+        playlist_prefetch.stop()
+        playlist_prefetch.cache = {}
+        playlist_prefetch.options = signature
+    end
+end
+
+local function query_segments_pipeline(job, allow_cached)
+    if not job then
+        playlist_prefetch.stop()
+        cancel_requests(state.query_context)
+        state.query_id = (state.query_id or 0) + 1
+        state.query_in_progress, state.prefetch_ready = false, false
+    end
+    local current_query_id, current_file_id = state.query_id, state.file_id
+    local source = job and job.media_info or state.media_info
+    if not user_opts.enabled or not source then return end
+    if not job then playlist_prefetch.sync_options() end
+
+    local context = job and job.context or {duration=state.duration}
+    local path_key = job and job.path_key or playlist_prefetch.key(state.path)
+    local signature = playlist_prefetch.signature(source)
+    local key = path_key and (path_key .. '\0' .. signature)
+    local cached = allow_cached and user_opts.playlist_prefetch and key and playlist_prefetch.cache[key]
+    if cached and (cached.signature ~= signature or not cached.id_found) then cached = nil end
+    local media_info = copy_table(cached and cached.media_info or source)
+    local function is_current()
+        return not context.cancelled and state.file_id == current_file_id and state.query_id == current_query_id
+    end
+    if not job then
+        state.query_context = context
+        state.query_in_progress, state.segments_loaded = true, false
+        state.segments = {}
+    end
     local providers = get_provider_priority(media_info)
     local media_type = media_info.is_tv and 'tvshow' or 'movie'
-    mp.commandv('script-message', 'jumpskip-provider-order', media_type, table.concat(providers, ','))
+    if not job then
+        mp.commandv('script-message', 'jumpskip-provider-order', media_type, table.concat(providers, ','))
+    end
 
-    local finished = false
+    local finished, id_resolved = false, false
     local function finish(results)
         if finished or not is_current() then return end
         finished = true
+        if user_opts.playlist_prefetch and key then
+            playlist_prefetch.cache[key] = {path_key=path_key, signature=signature, media_info=copy_table(media_info),
+                results=copy_table(results), duration=context.duration, id_found=id_resolved}
+        end
+        if job then
+            playlist_prefetch.active = nil
+            playlist_prefetch.schedule()
+            return
+        end
         local final_segs = {}
         for _, result in ipairs(results) do
             if result.ok and #result.segs > 0 then
@@ -2619,28 +2723,52 @@ local function query_segments_pipeline()
         table.sort(final_segs, function(a, b) return a.start_sec < b.start_sec end)
         state.media_info, state.segments = media_info, final_segs
         state.segments_loaded, state.query_in_progress = true, false
+        state.query_context, state.prefetch_ready = nil, true
         log_segments_summary(final_segs, results)
         publish_segments(final_segs)
         check_playback_position(mp.get_property_number('time-pos'))
+        playlist_prefetch.schedule()
     end
     if #providers == 0 then finish({}); return end
-    log_info('Querying segment timestamps from %d provider(s) [%s]: %s...', #providers, media_type, table.concat(providers, ' -> '))
-    resolve_title_to_imdb(media_info, current_file_id, function(id_found)
+    log_request(context, 'info', 'Querying segment timestamps from %d provider(s) [%s]: %s...', #providers, media_type, table.concat(providers, ' -> '))
+    local function resolved(id_found)
         if not is_current() then return end
+        id_resolved = id_found
         if not id_found then finish({}); return end
         local results, pending = {}, #providers
         for idx, name in ipairs(providers) do
+            if not is_current() then return end
+            local result = cached and cached.results[idx]
+            if result and result.name ~= name then result = nil end
+            local cached_duration = result and (result.duration or cached.duration)
+            local response_duration = context.duration
             local function completed(ok, segs, err)
                 if not is_current() or results[idx] then return end
-                results[idx] = {name=name, ok=ok, segs=ok and segs and filter_provider_segments(segs) or {}, err=err}
+                if not ok and result and result.ok then
+                    log_warn('%s refresh failed; using cached segments: %s', name, tostring(err))
+                    ok, segs, err = true, copy_table(result.segs), nil
+                    response_duration = cached_duration
+                end
+                results[idx] = {name=name, ok=ok, segs=ok and segs and filter_provider_segments(segs, context) or {},
+                    err=err, duration=response_duration}
                 pending = pending - 1
                 if pending == 0 then finish(results) end
             end
             local query = provider_fns[name]
-            if query then query(media_info, current_file_id, completed)
+            local duration_matches = result and (name == 'introdb' or cached_duration == context.duration)
+            if result and result.ok and duration_matches then
+                response_duration = cached_duration
+                completed(true, copy_table(result.segs), nil)
+            elseif query then query(media_info, current_file_id, completed, context)
             else completed(false, nil, 'Unknown provider: ' .. name) end
         end
-    end)
+    end
+    if cached then
+        log_info("Using prefetched metadata for '%s'", media_info.title or '?')
+        resolved(true)
+    else
+        resolve_title_to_imdb(media_info, current_file_id, resolved, context)
+    end
 end
 
 local function update_button_coordinates()
@@ -2977,6 +3105,9 @@ local function on_mouse_pos(_, mouse)
 end
 
 local function reset_state()
+    playlist_prefetch.stop()
+    cancel_requests(state.query_context)
+    state.query_context, state.prefetch_ready = nil, false
     state.file_id          = state.file_id + 1
     state.query_id         = (state.query_id or 0) + 1
     state.path             = nil
@@ -3022,6 +3153,7 @@ local function reset_state()
 end
 
 local function refresh_current_segments()
+    playlist_prefetch.cache = {}
     local path, filename = state.path, state.filename
     local duration, media_info = state.duration, state.media_info
     if state.base_chapter_list ~= nil then
@@ -3106,7 +3238,7 @@ local function normalize_absolute_path(path)
     return norm:lower()
 end
 
-local function is_directory_allowed(path)
+local function is_directory_allowed(path, context)
     local filter = user_opts.filter_directories or ""
     if #filter == 0 then
         return true
@@ -3181,7 +3313,7 @@ local function is_directory_allowed(path)
 
     for _, rule in ipairs(exclusions) do
         if rule_matches(rule) then
-            log_debug("filter_directories: file '%s' matched exclusion rule '%s' -> skipping", path, rule.raw)
+            log_request(context, 'debug', "filter_directories: file '%s' matched exclusion rule '%s' -> skipping", path, rule.raw)
             return false, "matched exclusion rule '" .. rule.raw .. "'"
         end
     end
@@ -3192,13 +3324,71 @@ local function is_directory_allowed(path)
 
     for _, rule in ipairs(inclusions) do
         if rule_matches(rule) then
-            log_debug("filter_directories: file '%s' matched inclusion rule '%s' -> allowed", path, rule.raw)
+            log_request(context, 'debug', "filter_directories: file '%s' matched inclusion rule '%s' -> allowed", path, rule.raw)
             return true
         end
     end
 
-    log_debug("filter_directories: file '%s' did not match any inclusion rules -> skipping", path)
+    log_request(context, 'debug', "filter_directories: file '%s' did not match any inclusion rules -> skipping", path)
     return false, "folder not in filter_directories inclusions"
+end
+
+function playlist_prefetch.schedule()
+    if not user_opts.enabled or not user_opts.playlist_prefetch or not state.prefetch_ready
+        or state.query_in_progress or playlist_prefetch.active or playlist_prefetch.timer then return end
+    playlist_prefetch.timer = mp.add_timeout(0.1, function()
+        playlist_prefetch.timer = nil
+        playlist_prefetch.sync_options()
+        local entries = mp.get_property_native('playlist') or {}
+        local position = mp.get_property_number('playlist-pos', -1)
+        if position < 0 then return end
+        local present, snapshot = {}, {tostring(state.file_id), tostring(position)}
+        for index, entry in ipairs(entries) do
+            local key = playlist_prefetch.key(entry.filename)
+            if key then present[key] = true end
+            if index > position then
+                snapshot[#snapshot + 1] = {entry.filename or '', entry.title or ''}
+            end
+        end
+        for key, cached in pairs(playlist_prefetch.cache) do
+            if not present[cached.path_key] then playlist_prefetch.cache[key] = nil end
+        end
+        local total = #entries - position
+        if total <= 1 then return end
+        local progress_key = utils.format_json(snapshot)
+        if playlist_prefetch.progress_key ~= progress_key then
+            playlist_prefetch.progress_key, playlist_prefetch.progress_complete = progress_key, false
+            log_info('Prefetching playlist: 1/%d', total)
+        end
+        local context = {quiet=true}
+        for index = position + 2, #entries do
+            local entry = entries[index]
+            local path = entry.filename
+            local key = playlist_prefetch.key(path)
+            if key and is_directory_allowed(path, context) then
+                local info = TitleParser.extract_media_metadata(path, path, entry.title or '', {})
+                local signature = playlist_prefetch.signature(info)
+                local cached = playlist_prefetch.cache[key .. '\0' .. signature]
+                if not cached then
+                    if #get_provider_priority(info) > 0 then
+                        context.duration = tonumber(entry.duration) or 0
+                        playlist_prefetch.active = context
+                        query_segments_pipeline({path_key=key, media_info=info, context=context})
+                        return
+                    end
+                end
+            end
+        end
+        if not playlist_prefetch.progress_complete then
+            playlist_prefetch.progress_complete = true
+            log_info('Prefetching playlist complete: %d/%d', total, total)
+        end
+    end)
+end
+
+local function on_playlist_changed()
+    playlist_prefetch.stop(true)
+    playlist_prefetch.schedule()
 end
 
 local function on_file_loaded()
@@ -3210,12 +3400,15 @@ local function on_file_loaded()
     local allowed, reason = is_directory_allowed(state.path)
     if not allowed then
         log_debug("Skipping file (%s): %s", reason or "excluded by filter_directories", state.path or "(none)")
+        playlist_prefetch.sync_options()
+        state.prefetch_ready = true
+        playlist_prefetch.schedule()
         return
     end
 
     state.duration   = mp.get_property_number("duration") or 0
     state.media_info = extract_media_metadata()
-    query_segments_pipeline()
+    query_segments_pipeline(nil, true)
 end
 
 local function on_end_file()
@@ -3247,11 +3440,21 @@ end)
 mp.observe_property("time-pos",       "number", function(_, cur_time) check_playback_position(cur_time) end)
 mp.observe_property("osd-dimensions", "native", on_osd_dimensions_change)
 mp.observe_property("mouse-pos",      "native", on_mouse_pos)
+mp.observe_property("playlist",       "native", on_playlist_changed)
 mp.observe_property("user-data/jumpskip/osc-colors", "native", function()
     if user_opts.button_color_by_segment and state.button_visible then render_skip_button() end
 end)
 
 mp.register_event("file-loaded", on_file_loaded)
 mp.register_event("end-file",    on_end_file)
+mp.register_event("start-file", function()
+    playlist_prefetch.stop()
+    cancel_requests(state.query_context)
+    state.prefetch_ready = false
+end)
+mp.register_event("shutdown", function()
+    playlist_prefetch.stop()
+    cancel_requests(state.query_context)
+end)
 
 load_configuration()
