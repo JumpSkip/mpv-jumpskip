@@ -1,18 +1,18 @@
 --[[
     mpv-skip-segment
-    version 2.3
+    version 2.4
     ================
     A Lua script for mpv that detects and skips segments (intros, recaps, outros/credits, previews,
     and movie end-credits/post-credits) using crowdsourced data from TheIntroDB (api.theintrodb.org),
-    IntroDB (introdb.app), and SkipDB (skipdb.tv).
+    IntroDB (api.introdb.app), SkipDB (api.skipdb.tv), and AniSkip (api.aniskip.com).
 
     Features:
-    - Triple provider support: TheIntroDB (v4 OpenAPI), IntroDB (OpenAPI), and SkipDB (openAPI)
-    - Movie support: IntroDB end-credits (outro) and post-credits segments (is_movie=true)
+    - Four providers
+    - Movie support: IntroDB end-credits (outro) and post-credits segments
     - Automatic provider fallback and intelligent segment merging
-    - Fully non-blocking asynchronous HTTP requests using curl via mp.command_native_async
+    - Fully non-blocking asynchronous HTTP requests using curl
     - Interactive on-screen clickable button (Netflix-style) with cursor hover feedback
-    - Dynamic mouse click capture (MBTN_LEFT) only while hovering over the button
+    - Dynamic mouse click capture only while hovering over the button
     - Keybindable action (default: Tab)
     - Automatic media identification via file metadata tags, filename regex (SxxExx, movie years, IDs),
       and fallback title lookup
@@ -61,6 +61,11 @@ local user_opts = {
     skipdb_recap_segment       = true,
     skipdb_outro_segment       = true,
     skipdb_preview_segment     = true,
+    aniskip_intro_segment      = true,
+    aniskip_outro_segment      = true,
+    aniskip_recap_segment      = true,
+    anime_episode_numbering    = "tvdb",
+    aniskip_duration_tolerance = 15,
     mark_chapters        = true,
     default_chapter_title = "Chapter",
     start_offset         = 0.0,
@@ -68,6 +73,7 @@ local user_opts = {
     outro_end_gap        = 5.0,
     provider_priority_tvshow = "",
     provider_priority_movie = "",
+    provider_priority_anime = "",
     merge_providers      = true,
     theintrodb_api_key   = "",
     introdb_api_key      = "",
@@ -185,7 +191,7 @@ local VALID_SEGMENT_TYPES = { intro = true, recap = true, outro = true, preview 
 local autoskip_type_set     = {}
 local autoskip_types_active = false
 
-local VALID_PROVIDERS = { theintrodb = true, introdb = true, skipdb = true }
+local VALID_PROVIDERS = { theintrodb = true, introdb = true, skipdb = true, aniskip = true }
 
 local function parse_provider_priority(priority_str)
     local providers = {}
@@ -202,11 +208,15 @@ local function parse_provider_priority(priority_str)
                     seen[p] = true
                 end
             else
-                log_warn("Ignoring unknown provider '%s' in priority list (valid: theintrodb, introdb, skipdb)", p)
+                log_warn("Ignoring unknown provider '%s' in priority list (valid: theintrodb, introdb, skipdb, aniskip)", p)
             end
         end
     end
     return providers
+end
+
+local function finite_number(value)
+    return type(value) == 'number' and value == value and value > -math.huge and value < math.huge
 end
 
 local function validate_options()
@@ -239,6 +249,20 @@ local function validate_options()
         gap = 0
     end
     user_opts.outro_end_gap = gap
+    if user_opts.anime_episode_numbering ~= 'tmdb' and user_opts.anime_episode_numbering ~= 'tvdb'
+        and user_opts.anime_episode_numbering ~= 'absolute' then
+        log_warn('Invalid anime_episode_numbering; using tmdb')
+        user_opts.anime_episode_numbering = 'tmdb'
+    end
+    local tolerance = tonumber(user_opts.aniskip_duration_tolerance)
+    if not tolerance or tolerance ~= tolerance or tolerance < 0 or tolerance == math.huge then tolerance = 15 end
+    user_opts.aniskip_duration_tolerance = tolerance
+    for key, default in pairs(default_opts) do
+        if type(default) == 'number' and not finite_number(user_opts[key]) then
+            log_warn('Invalid numeric option %s; using %s', key, tostring(default))
+            user_opts[key] = default
+        end
+    end
 end
 
 local function load_configuration()
@@ -292,9 +316,10 @@ local function load_configuration()
     update_keybind()
     update_submission_keybind()
     update_runtime_keybinds()
-    log_info("Configuration active (keybind: %s, auto_skip: %s, tv_priority: %s, movie_priority: %s)%s",
+    log_info("Configuration active (keybind: %s, auto_skip: %s, tv_priority: %s, movie_priority: %s, anime_priority: %s)%s",
         tostring(user_opts.keybind), tostring(user_opts.auto_skip),
         tostring(user_opts.provider_priority_tvshow), tostring(user_opts.provider_priority_movie),
+        tostring(user_opts.provider_priority_anime),
         loaded_from and (" [source: " .. loaded_from .. "]") or "")
 end
 
@@ -410,14 +435,16 @@ local function prepare_title(raw)
     local group, rest = s:match('^%s*%((.-)%)%s*[_%-]?%s*(.*)$')
     if group and (group:lower() == 'hi10' or group:lower() == 'hi10p') and has_title(rest) then s = rest end
     s = s:gsub('%b{}', function(block)
-        if block:lower():match('imdb') or block:lower():match('tmdb') or block:lower():match('tvdb') then return ' ' end
+        if block:lower():match('imdb') or block:lower():match('tmdb') or block:lower():match('tvdb')
+            or block:lower():match('^%{mal[%s:=_-]') or block:lower():match('^%{anilist[%s:=_-]') then return ' ' end
         return block
     end)
     for _, pattern in ipairs({'%b[]', '%b()'}) do
         s = s:gsub(pattern, function(block)
             local inner = block:sub(2, -2)
             if (#inner >= 8 and inner:match('^%x+$')) or inner:lower():match('^imdb[%s:=_-]')
-                or inner:lower():match('^[tT][mv]db[%s:=_-]') then return ' ' end
+                or inner:lower():match('^[tT][mv]db[%s:=_-]') or inner:lower():match('^mal[%s:=_-]')
+                or inner:lower():match('^anilist[%s:=_-]') then return ' ' end
             return block
         end)
     end
@@ -507,16 +534,18 @@ function TitleParser.parse_season_episode(str)
     if not a then return nil, nil, nil, false end
     local tail = low:sub(b + 1)
     if tail:match('^v%d+') then tail = tail:gsub('^v%d+', '') end
+    local episode_ambiguous = tail:match('^%.%d') ~= nil or tail:match('^e%d') ~= nil
+        or tail:match('^%s*[%-%+]%s*e?%d') ~= nil
     if tail:match('^[%w]') and not tail:match('^e%d+') then return nil, nil, nil, false end
     if tonumber(episode) > 9999 then return nil, nil, nil, false end
-    local prefix = str:sub(1, a - 1):gsub('[%s%._%-%[%]():]+$', '')
+    local prefix = str:sub(1, a - 1):gsub('[%s%._%-%[(:]+$', '')
     if missing then
         local title, sn = prefix:lower():match('^(.-)%s+season%s*(%d%d?)$')
         if not title then title, sn = prefix:lower():match('^(.-)[%s._]+s(%d%d?)$') end
         if title then prefix, season, missing = prefix:sub(1, #title), sn, false end
     end
     local title, year, title_with_year = parse_title_year(prefix)
-    return title, tonumber(season), tonumber(episode), missing, year, title_with_year
+    return title, tonumber(season), tonumber(episode), missing, year, title_with_year, episode_ambiguous
 end
 
 function TitleParser.canonical_title(str)
@@ -754,9 +783,9 @@ function TitleParser.score_series_candidate(candidate, query_title, target_year_
 
     if score > 0 and target_year and cand_year then
         local diff = math.abs(cand_year - target_year)
-        if diff <= 1 then
+        if diff == 0 then
             score = score + 200
-        elseif diff > 1 then
+        else
             return -99999
         end
     end
@@ -796,7 +825,7 @@ function TitleParser.extract_media_metadata(path, filename, raw_media_title, met
     end
     local info = {is_tv=false, season_missing=false, year_ambiguous=false}
     info.imdb_id = imdb_id(tag('imdbid', 'imdb'))
-    for _, provider in ipairs({'tmdb', 'tvdb'}) do
+    for _, provider in ipairs({'tmdb', 'tvdb', 'mal', 'anilist'}) do
         local value = tag(provider .. 'id', provider)
         info[provider .. '_id'] = value and integer(value:match('%d+'), 1) or nil
     end
@@ -815,7 +844,7 @@ function TitleParser.extract_media_metadata(path, filename, raw_media_title, met
     for _, value in ipairs(texts) do
         value = value:lower()
         info.imdb_id = info.imdb_id or imdb_id(value)
-        for _, provider in ipairs({'tmdb', 'tvdb'}) do
+        for _, provider in ipairs({'tmdb', 'tvdb', 'mal', 'anilist'}) do
             local id = value:match('%f[%w]' .. provider .. 'id[%s:=_-]+(%d+)%f[%W]')
                 or value:match('%f[%w]' .. provider .. '[%s:=_-]+(%d+)%f[%W]')
             info[provider .. '_id'] = info[provider .. '_id'] or integer(id, 1)
@@ -825,10 +854,10 @@ function TitleParser.extract_media_metadata(path, filename, raw_media_title, met
         if not value or value == '' or value:match('^av://') or value:match('^lavfi:') then return nil end
         if basename or is_url(value) then value = media_basename(value, remote or is_url(value)) end
         if generic_media_name(value, remote) then return nil end
-        local title, season, episode, missing, year, full = TitleParser.parse_season_episode(value)
+        local title, season, episode, missing, year, full, episode_ambiguous = TitleParser.parse_season_episode(value)
         if title ~= nil then
             return {title=title, season=season, episode=episode, season_missing=missing,
-                year=year, title_with_year=full, is_tv=true, year_ambiguous=false}
+                year=year, title_with_year=full, is_tv=true, year_ambiguous=false, anime_episode_ambiguous=episode_ambiguous}
         end
         local ambiguous
         title, year, full, ambiguous = parse_title_year(value)
@@ -862,6 +891,7 @@ function TitleParser.extract_media_metadata(path, filename, raw_media_title, met
         or (not manifest and file_info and file_info.is_tv and file_info)
     if episode_info then
         info.season, info.episode, info.season_missing = episode_info.season, episode_info.episode, episode_info.season_missing
+        info.anime_episode_ambiguous = episode_info.anime_episode_ambiguous
         info.is_tv = true
     end
     if meta_season ~= nil then info.season, info.season_missing, info.is_tv = meta_season, false, true end
@@ -895,6 +925,10 @@ function TitleParser.extract_media_metadata(path, filename, raw_media_title, met
     local year = date and tonumber(date:match('^(%d%d%d%d)%f[%D]'))
     if year and year >= 1888 and year <= TitleParser.max_release_year() then info.year, info.year_ambiguous = year, false end
     if not has_title(info.title) then info.title = nil end
+    info.general_id_supplied = info.imdb_id ~= nil or info.tmdb_id ~= nil or info.tvdb_id ~= nil
+    info.source_season_missing = info.season_missing
+    info.mal_episode = tonumber(tag('malepisode') or '')
+    info.episode_numbering = tag('episodenumbering')
     return info
 end
 
@@ -915,12 +949,38 @@ local function format_hms(sec)
     return string.format("%d:%02d:%02d", hours, minutes, seconds)
 end
 
-local function make_segment(seg_type, label, start_sec, end_sec, provider)
+local function segment_time(seconds, milliseconds, fallback)
+    if seconds ~= nil then return finite_number(seconds) and seconds or nil end
+    if milliseconds ~= nil then return finite_number(milliseconds) and milliseconds / 1000 or nil end
+    return fallback
+end
+
+local SEGMENT_BOUNDARY_TOLERANCE = 3.0
+
+local function bounded_segment_end(kind, provider, start_sec, end_sec, duration)
+    if finite_number(duration) and duration > 0 and end_sec > duration then
+        local tail = kind == 'outro' or kind == 'preview' or kind == 'post_credits'
+        if provider == 'AniSkip' or not tail or end_sec - duration > SEGMENT_BOUNDARY_TOLERANCE
+            or duration - start_sec < user_opts.min_segment_duration then return nil end
+        return duration
+    end
+    return end_sec
+end
+
+local function make_segment(seg_type, label, start_sec, end_sec, provider, duration)
+    if not finite_number(start_sec) or not finite_number(end_sec) or start_sec < 0
+        or end_sec - start_sec < user_opts.min_segment_duration then return nil end
+    local known_duration = finite_number(duration) and duration > 0
+    end_sec = bounded_segment_end(seg_type, provider, start_sec, end_sec, duration)
+    if not end_sec then return nil end
+    start_sec, end_sec = math.max(0, start_sec + user_opts.start_offset), end_sec + user_opts.end_offset
+    if known_duration then end_sec = math.min(end_sec, duration) end
+    if not finite_number(start_sec) or not finite_number(end_sec) or end_sec <= start_sec then return nil end
     return {
         type      = seg_type,
         label     = label,
-        start_sec = math.max(0, start_sec + user_opts.start_offset),
-        end_sec   = end_sec + user_opts.end_offset,
+        start_sec = start_sec,
+        end_sec   = end_sec,
         provider  = provider,
         skipped   = false,
     }
@@ -1041,7 +1101,8 @@ local function detect_chapter_segments(chapters, duration, existing_segments, me
                     if cat == "outro" and media_info and not media_info.is_tv then
                         label = "Credits"
                     end
-                    table.insert(detected, make_segment(cat, label, start_time, end_time, "Chapters"))
+                    local segment = make_segment(cat, label, start_time, end_time, "Chapters", duration)
+                    if segment then table.insert(detected, segment) end
                     log_info("Detected %s segment from chapter: '%s' at %.2fs-%.2fs",
                         cat, ch.title, start_time, end_time)
                 end
@@ -1079,6 +1140,7 @@ local state = {
     auto_skip_timer      = nil,
     auto_skip_target_time = nil,
     button_timeout_timer = nil,
+    notification_timer   = nil,
     last_time            = nil,
     display_w            = 1920,
     display_h            = 1080,
@@ -1114,6 +1176,7 @@ end
 local function cancel_requests(context)
     if not context then return end
     context.cancelled = true
+    for _, timer in ipairs(context.timers or {}) do timer:kill() end
     local requests = context.requests or {}
     context.requests = {}
     for id in pairs(requests) do
@@ -1406,7 +1469,7 @@ local function query_theintrodb(media_info, current_file_id, callback, context)
             callback(true, {}, nil)
             return
         end
-        if not success or not data then
+        if not success or type(data) ~= 'table' then
             callback(false, nil, err or "TheIntroDB request failed")
             return
         end
@@ -1420,20 +1483,22 @@ local function query_theintrodb(media_info, current_file_id, callback, context)
         local function add_ranges(list, seg_type, label)
             if not list or type(list) ~= "table" then return end
             for _, item in ipairs(list) do
-                local s_ms = item.start_ms
-                local e_ms = item.end_ms
-                local is_no_segment = false
-                if (seg_type == "intro" or seg_type == "recap") and e_ms == 0 then
-                    is_no_segment = true
-                elseif (seg_type == "outro" or seg_type == "preview") and (s_ms == 0 or e_ms == 0) then
-                    is_no_segment = true
-                end
+                if type(item) == 'table' and (item.start_ms ~= nil or item.end_ms ~= nil) then
+                    local s_ms = item.start_ms
+                    local e_ms = item.end_ms
+                    local is_no_segment = false
+                    if (seg_type == "intro" or seg_type == "recap") and e_ms == 0 then
+                        is_no_segment = true
+                    elseif (seg_type == "outro" or seg_type == "preview") and (s_ms == 0 or e_ms == 0) then
+                        is_no_segment = true
+                    end
 
-                if not is_no_segment then
-                    local s_sec = s_ms and (s_ms / 1000.0) or 0.0
-                    local e_sec = e_ms and (e_ms / 1000.0) or (duration > 0 and duration or nil)
-                    if e_sec and (e_sec - s_sec) >= user_opts.min_segment_duration then
-                        table.insert(normalized, make_segment(seg_type, label, s_sec, e_sec, "TheIntroDB"))
+                    if not is_no_segment then
+                        local s_sec = segment_time(nil, s_ms, 0)
+                        local tail = seg_type == 'outro' or seg_type == 'preview'
+                        local e_sec = segment_time(nil, e_ms, tail and duration or nil)
+                        local segment = make_segment(seg_type, label, s_sec, e_sec, "TheIntroDB", duration)
+                        if segment then table.insert(normalized, segment) end
                     end
                 end
             end
@@ -1451,6 +1516,7 @@ local function query_theintrodb(media_info, current_file_id, callback, context)
 end
 
 local function query_introdb(media_info, current_file_id, callback, context)
+    local duration = context and context.duration or state.duration
     if not media_info.imdb_id then
         callback(false, nil, "IntroDB requires imdb_id")
         return
@@ -1474,7 +1540,7 @@ local function query_introdb(media_info, current_file_id, callback, context)
 
     async_http_get(url, headers, user_opts.request_timeout, function(success, data, err)
         if state.file_id ~= current_file_id or (context and context.cancelled) then return end
-        if not success or not data then
+        if not success or type(data) ~= 'table' then
             callback(false, nil, err or "IntroDB request failed")
             return
         end
@@ -1487,11 +1553,10 @@ local function query_introdb(media_info, current_file_id, callback, context)
 
         local function add_segment(item, seg_type, label)
             if not item or type(item) ~= "table" then return end
-            local s_sec = item.start_sec or (item.start_ms and (item.start_ms / 1000.0)) or 0.0
-            local e_sec = item.end_sec   or (item.end_ms   and (item.end_ms   / 1000.0)) or nil
-            if e_sec and (e_sec - s_sec) >= user_opts.min_segment_duration then
-                table.insert(normalized, make_segment(seg_type, label, s_sec, e_sec, "IntroDB"))
-            end
+            local s_sec = segment_time(item.start_sec, item.start_ms, 0)
+            local e_sec = segment_time(item.end_sec, item.end_ms)
+            local segment = make_segment(seg_type, label, s_sec, e_sec, "IntroDB", duration)
+            if segment then table.insert(normalized, segment) end
         end
 
         if user_opts.skip_intro then add_segment(data.intro,  "intro",  "Intro")  end
@@ -1533,7 +1598,7 @@ local function query_skipdb(media_info, current_file_id, callback, context)
 
     async_http_get(url, headers, user_opts.request_timeout, function(success, data, err)
         if state.file_id ~= current_file_id or (context and context.cancelled) then return end
-        if not success or not data then
+        if not success or type(data) ~= 'table' then
             callback(false, nil, err or "SkipDB request failed")
             return
         end
@@ -1553,11 +1618,10 @@ local function query_skipdb(media_info, current_file_id, callback, context)
         local function add_segment(item, seg_type, label)
             if not item or type(item) ~= "table" then return end
             if item.start_ms == 0 and item.end_ms == 0 then return end
-            local s_sec = (item.start_ms or 0) / 1000.0
-            local e_sec = item.end_ms and (item.end_ms / 1000.0) or nil
-            if e_sec and (e_sec - s_sec) >= user_opts.min_segment_duration then
-                table.insert(normalized, make_segment(seg_type, label, s_sec, e_sec, "SkipDB"))
-            end
+            local s_sec = segment_time(nil, item.start_ms, 0)
+            local e_sec = segment_time(nil, item.end_ms)
+            local segment = make_segment(seg_type, label, s_sec, e_sec, "SkipDB", duration)
+            if segment then table.insert(normalized, segment) end
         end
 
         if user_opts.skip_intro   then add_segment(segs.intro,   "intro",   "Intro")   end
@@ -1570,7 +1634,364 @@ local function query_skipdb(media_info, current_file_id, callback, context)
     end, context)
 end
 
+local Anime = {cache={}, order={}, next_anilist=0, cooldown={}}
+
+function Anime.number(value)
+    return type(value) == 'number' and value == value and value >= 0 and value < math.huge
+end
+
+function Anime.request(url, payload, context, done)
+    if context.cancelled then return end
+    local key = url .. (payload and utils.format_json(payload) or '')
+    local cached = Anime.cache[key]
+    if cached then done(true, cached); return end
+    local host = url:match('^https://([^/]+)')
+    local function send()
+        if context.cancelled then return end
+        if (Anime.cooldown[host] or 0) > mp.get_time() then
+            done(false, nil, 'Anime service is cooling down after a failed request'); return
+        end
+        if host == 'graphql.anilist.co' then
+            local now = mp.get_time()
+            local delay = math.max(0, Anime.next_anilist - now)
+            if delay > 0 then
+                context.timers = context.timers or {}
+                context.timers[#context.timers + 1] = mp.add_timeout(delay, send)
+                return
+            end
+            Anime.next_anilist = now + 2.1
+        end
+        async_http_request(payload and 'POST' or 'GET', url, nil, payload, user_opts.request_timeout,
+            function(ok, data, err, code)
+                if context.cancelled then return end
+                if code == 404 then ok, data = true, {found=false} end
+                if type(data) ~= 'table' or data.errors then ok = false end
+                if ok then
+                    Anime.cache[key] = data
+                    Anime.order[#Anime.order + 1] = key
+                    if #Anime.order > 128 then Anime.cache[table.remove(Anime.order, 1)] = nil end
+                else
+                    Anime.cooldown[host] = mp.get_time() + (code == 429 and 60 or 10)
+                end
+                done(ok, data, err)
+            end, context)
+    end
+    send()
+end
+
+function Anime.catalog(variables, context, done)
+    local fields = 'id idMal type format episodes title { romaji english native } synonyms startDate { year }'
+    local query
+    if variables.search then
+        query = 'query($search:String!){Page(perPage:25){media(search:$search,type:ANIME){' .. fields .. '}}}'
+    else
+        query = 'query($id:Int,$idMal:Int){Media(id:$id,idMal:$idMal,type:ANIME){' .. fields .. '}}'
+    end
+    Anime.request('https://graphql.anilist.co', {query=query, variables=variables}, context, function(ok, data, err)
+        local result = ok and type(data.data) == 'table' and data.data or {}
+        if variables.search then result = type(result.Page) == 'table' and result.Page.media or nil
+        else
+            local media = result.Media
+            if type(media) ~= 'table' or (variables.idMal and media.idMal ~= variables.idMal)
+                or (variables.id and media.id ~= variables.id) then media = nil end
+            result = media and {media} or nil
+        end
+        done(ok and type(result) == 'table', result or {}, err)
+    end)
+end
+
+function Anime.mappings(context, done)
+    if Anime.mapping_rows then done(true, Anime.mapping_rows); return end
+    Anime.request('https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-mini.json', nil,
+        context, function(ok, rows, err)
+            if ok and type(rows[1]) == 'table' then
+                Anime.mapping_rows = {}
+                for _, row in ipairs(rows) do
+                    if type(row) == 'table' and integer(row.mal_id, 1) then
+                        Anime.mapping_rows[#Anime.mapping_rows + 1] = {mal_id=row.mal_id, type=row.type,
+                            imdb_id=row.imdb_id, themoviedb_id=row.themoviedb_id, tvdb_id=row.tvdb_id,
+                            season=row.season, episode_offset=row.episode_offset}
+                    end
+                end
+                Anime.cache['https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-mini.json'] = nil
+                done(true, Anime.mapping_rows)
+            else done(false, {}, err or 'Invalid anime mapping list') end
+        end)
+end
+
+function Anime.contains(list, value)
+    if type(list) ~= 'table' or value == nil then return false end
+    for _, item in ipairs(list) do if item == value then return true end end
+    return false
+end
+
+function Anime.matches(row, info)
+    local tmdb = type(row.themoviedb_id) == 'table' and row.themoviedb_id or {}
+    local imdb_match = Anime.contains(row.imdb_id, info.imdb_id)
+    local tmdb_match = info.is_tv and tmdb.tv == info.tmdb_id
+        or not info.is_tv and Anime.contains(tmdb.movie, info.tmdb_id)
+    if info.general_id_supplied then
+        if info.imdb_id and not imdb_match then return false end
+        if info.tmdb_id and not tmdb_match then return false end
+        if info.tvdb_id and row.tvdb_id ~= info.tvdb_id then return false end
+    end
+    return imdb_match
+        or (info.tvdb_id ~= nil and row.tvdb_id == info.tvdb_id)
+        or (info.tmdb_id ~= nil and ((info.is_tv and tmdb.tv == info.tmdb_id)
+            or (not info.is_tv and Anime.contains(tmdb.movie, info.tmdb_id))))
+end
+
+function Anime.numbering(info)
+    if info.episode_numbering == 'absolute' or info.episode_numbering == 'tvdb'
+        or info.episode_numbering == 'tmdb' then return info.episode_numbering end
+    if info.source_season_missing == true or (info.source_season_missing == nil and info.season_missing) then
+        return 'absolute'
+    end
+    return user_opts.anime_episode_numbering
+end
+
+function Anime.choose_mapping(rows, info, anchor)
+    local numbering = Anime.numbering(info)
+    local best, best_episode, best_offset
+    for _, row in ipairs(rows) do
+        local related = Anime.matches(row, info)
+        if anchor then
+            local a = type(anchor.themoviedb_id) == 'table' and anchor.themoviedb_id or {}
+            local b = type(row.themoviedb_id) == 'table' and row.themoviedb_id or {}
+            related = numbering == 'tvdb' and anchor.tvdb_id ~= nil and anchor.tvdb_id == row.tvdb_id
+                or numbering == 'tmdb' and a.tv ~= nil and a.tv == b.tv
+        end
+        if related then
+            if not info.is_tv and row.type == 'MOVIE' then
+                if best and best.mal_id ~= row.mal_id then return nil, nil end
+                best, best_episode = row, 1
+            end
+            local season = type(row.season) == 'table' and row.season[numbering]
+            local offset = type(row.episode_offset) == 'table' and row.episode_offset[numbering] or 0
+            if numbering ~= 'absolute' and info.is_tv and info.season ~= 0 and season == info.season
+                and type(offset) == 'number' and offset == offset and math.abs(offset) < math.huge
+                and Anime.number(info.episode) and info.episode > offset then
+                if not best_offset or offset > best_offset then
+                    best, best_episode, best_offset = row, info.episode - offset, offset
+                elseif offset == best_offset and best.mal_id ~= row.mal_id then
+                    best_episode = nil
+                end
+            end
+        end
+    end
+    return best, best_episode
+end
+
+function Anime.normalize_title(title)
+    return (title:gsub('’', "'"):gsub('‘', "'"):gsub('“', '"'):gsub('”', '"')
+        :gsub('–', '-'):gsub('—', '-'):gsub('×', ' x '):gsub(' ', ' '))
+end
+
+function Anime.score(candidate, info)
+    if type(candidate) ~= 'table' or candidate.type ~= 'ANIME' or not integer(candidate.idMal, 1) then return -1 end
+    if info.is_tv and candidate.format == 'MOVIE' then return -1 end
+    if not info.is_tv and candidate.format ~= 'MOVIE' then return -1 end
+    local names = {}
+    for _, name in pairs(type(candidate.title) == 'table' and candidate.title or {}) do
+        if type(name) == 'string' then names[#names + 1] = name end
+    end
+    for _, name in ipairs(type(candidate.synonyms) == 'table' and candidate.synonyms or {}) do
+        if type(name) == 'string' then names[#names + 1] = name end
+    end
+    local year = type(candidate.startDate) == 'table' and candidate.startDate.year
+    local best = -1
+    for _, name in ipairs(names) do
+        local entry = {name=Anime.normalize_title(name), year=year}
+        local query = Anime.normalize_title(info.title or '')
+        local score = info.is_tv and TitleParser.score_series_candidate(entry, query, info.year)
+            or TitleParser.score_movie_candidate(entry, query, info.year)
+        best = math.max(best, score)
+    end
+    return best
+end
+
+function Anime.resolve(info, context, done)
+    local function accept(id, episode, title, source)
+        if not integer(id, 1) or not Anime.number(episode) or episode < 0.5 then
+            done(false, nil, 'Missing or invalid MAL episode'); return
+        end
+        local identity = {mal_id=id, episode=episode, title=title, source=source}
+        log_request(context, 'info', "Anime match: '%s', MAL %d episode %s (%s)", title or '?', id, tostring(episode), source)
+        done(true, identity)
+    end
+    if info.mal_id and info.mal_episode ~= nil then
+        accept(info.mal_id, info.mal_episode, info.title, 'explicit MAL coordinates'); return
+    end
+    if info.year_ambiguous then done(false, nil, 'Conflicting release years'); return end
+    if info.anime_episode_ambiguous then done(false, nil, 'Combined/fractional episode filename needs explicit MAL coordinates'); return end
+    if info.is_tv and (not Anime.number(info.episode) or info.episode < 1 or info.season == 0) then
+        done(false, nil, 'Specials or unknown episodes need explicit MAL coordinates'); return
+    end
+    local function finish_entry(entry, episode, source, redirect)
+        if type(entry) ~= 'table' or entry.type ~= 'ANIME' or not integer(entry.idMal, 1)
+            or (info.is_tv and entry.format == 'MOVIE') or (not info.is_tv and entry.format ~= 'MOVIE') then
+            done(false, nil, 'Anime format conflicts with the file'); return
+        end
+        local title = type(entry.title) == 'table' and (entry.title.english or entry.title.romaji)
+        local count = tonumber(entry.episodes)
+        local function finish()
+            if count and count > 0 and episode > count then done(false, nil, 'Anime episode exceeds entry length')
+            else accept(entry.idMal, episode, title, source) end
+        end
+        if not redirect then finish(); return end
+        Anime.request('https://api.aniskip.com/v2/relation-rules/' .. entry.idMal, nil, context, function(ok, data)
+            if not ok then done(false, nil, 'Could not verify anime episode numbering'); return end
+            local match, mapped_episode, width
+            for _, rule in ipairs(type(data.rules) == 'table' and data.rules or {}) do
+                local from = type(rule) == 'table' and rule.from
+                local to = type(rule) == 'table' and rule.to
+                if type(from) == 'table' and type(to) == 'table' and Anime.number(from.start)
+                    and Anime.number(to.start) and integer(to.malId, 1)
+                    and (from['end'] == nil or Anime.number(from['end']))
+                    and episode >= from.start and (not from['end'] or episode <= from['end']) then
+                    local translated = to.start + episode - from.start
+                    local range = from['end'] and from['end'] - from.start or math.huge
+                    if (to['end'] == nil or (Anime.number(to['end']) and translated <= to['end']))
+                        and (not width or range < width) then
+                        match, mapped_episode, width = to.malId, translated, range
+                    end
+                end
+            end
+            if not match then finish(); return end
+            Anime.catalog({idMal=match}, context, function(found, entries)
+                if not found then done(false, nil, 'Could not verify redirected anime entry'); return end
+                finish_entry(entries[1], mapped_episode, source .. ', relation rule', false)
+            end)
+        end)
+    end
+    local function load_mapped(row, episode, source)
+        Anime.catalog({idMal=row.mal_id}, context, function(ok, entries)
+            if not ok then done(false, nil, 'Anime metadata request failed'); return end
+            finish_entry(entries[1], episode, source, false)
+        end)
+    end
+    local function use_candidate(entry, explicit)
+        if not entry then done(false, nil, 'No compatible anime title'); return end
+        local episode = info.is_tv and info.episode or 1
+        if explicit or not info.is_tv or Anime.numbering(info) == 'absolute' then
+            finish_entry(entry, episode, explicit and 'supplied anime ID' or 'title match', info.is_tv)
+            return
+        end
+        Anime.mappings(context, function(ok, rows)
+            if not ok then done(false, nil, 'Season mapping unavailable'); return end
+            local anchor
+            for _, row in ipairs(rows) do if row.mal_id == entry.idMal then anchor = row; break end end
+            local row, mapped = Anime.choose_mapping(rows, info, anchor)
+            if row and mapped then load_mapped(row, mapped, Anime.numbering(info) .. ' season mapping')
+            else done(false, nil, 'No unambiguous anime season mapping; supply MAL ID and episode') end
+        end)
+    end
+    if info.mal_id or info.anilist_id then
+        Anime.catalog(info.mal_id and {idMal=info.mal_id} or {id=info.anilist_id}, context, function(ok, entries)
+            if ok then use_candidate(entries[1], true) else done(false, nil, 'Supplied anime ID lookup failed') end
+        end)
+        return
+    end
+    local function search()
+        if not has_title(info.title) then done(false, nil, 'No anime title or ID'); return end
+        Anime.catalog({search=info.title}, context, function(ok, entries)
+            if not ok then done(false, nil, 'Anime title search failed'); return end
+            local best, score = nil, 299
+            for rank, entry in ipairs(entries) do
+                local candidate_score = Anime.score(entry, info) - (rank - 1) * 0.5
+                if info.general_id_supplied then
+                    local compatible = false
+                    for _, row in ipairs(Anime.mapping_rows or {}) do
+                        if row.mal_id == entry.idMal and Anime.matches(row, info) then compatible = true; break end
+                    end
+                    if not compatible then candidate_score = -1 end
+                end
+                if candidate_score > score then best, score = entry, candidate_score end
+            end
+            use_candidate(best, false)
+        end)
+    end
+    if info.imdb_id or info.tmdb_id or info.tvdb_id then
+        Anime.mappings(context, function(ok, rows)
+            local known = false
+            for _, row in ipairs(rows) do if Anime.matches(row, info) then known = true; break end end
+            if info.general_id_supplied and not known then
+                done(false, nil, 'Supplied media ID has no verified anime mapping'); return
+            end
+            if ok and Anime.numbering(info) ~= 'absolute' then
+                local row, episode = Anime.choose_mapping(rows, info)
+                if row and episode then load_mapped(row, episode, Anime.numbering(info) .. ' ID mapping'); return end
+            end
+            search()
+        end)
+    else search() end
+end
+
+local function query_aniskip(media_info, current_file_id, callback, context)
+    context = context or {duration=state.duration}
+    media_info.anime = nil
+    local function current() return not context.cancelled and state.file_id == current_file_id end
+    local function resolved(ok, identity, err)
+        if not current() then return end
+        if not ok then callback(false, nil, err); return end
+        media_info.anime = identity
+        local duration = context.duration or 0
+        if not Anime.number(duration) or duration <= 0 then
+            callback(true, {}); return
+        end
+        if (Anime.cooldown['api.aniskip.com'] or 0) > mp.get_time() then
+            callback(false, nil, 'AniSkip is cooling down after a failed request'); return
+        end
+        local url = string.format('https://api.aniskip.com/v2/skip-times/%d/%s?types=op&types=ed&types=recap&episodeLength=%s',
+            identity.mal_id, tostring(identity.episode), tostring(duration))
+        async_http_get(url, nil, user_opts.request_timeout, function(success, data, error_message, code)
+            if not current() then return end
+            if code == 429 then Anime.cooldown['api.aniskip.com'] = mp.get_time() + 60 end
+            if code == 404 or (success and type(data) == 'table' and data.found == false) then
+                callback(true, {}); return
+            end
+            if not success or type(data) ~= 'table' or data.error or data.found ~= true or type(data.results) ~= 'table' then
+                callback(false, nil, error_message or 'Invalid AniSkip response'); return
+            end
+            local chosen, distances = {}, {}
+            local types = {op='intro', ed='outro', recap='recap'}
+            for _, item in ipairs(data.results) do
+                if type(item) == 'table' then
+                    local kind = types[item.skipType]
+                    local interval = type(item.interval) == 'table' and item.interval or {}
+                    local start, stop, length = interval.startTime, interval.endTime, item.episodeLength
+                    if kind and user_opts['skip_' .. kind] and user_opts['aniskip_' .. kind .. '_segment']
+                        and Anime.number(start) and Anime.number(stop) and Anime.number(length) and length > 0
+                        and stop > start and stop <= length and stop <= duration
+                        and math.abs(length - duration) <= user_opts.aniskip_duration_tolerance
+                        and stop - start >= user_opts.min_segment_duration then
+                        local distance = math.abs(length - duration)
+                        if not distances[kind] or distance < distances[kind] then
+                            local label = kind == 'intro' and 'Intro' or kind == 'recap' and 'Recap'
+                                or media_info.is_tv and 'Outro' or 'Credits'
+                            local segment = make_segment(kind, label, start, stop, 'AniSkip', duration)
+                            if segment then
+                                chosen[kind], distances[kind] = segment, distance
+                            end
+                        end
+                    end
+                end
+            end
+            local segments = {}
+            for _, kind in ipairs({'intro', 'recap', 'outro'}) do
+                if chosen[kind] then segments[#segments + 1] = chosen[kind] end
+            end
+            log_request(context, 'info', 'AniSkip returned %d compatible segment(s)', #segments)
+            callback(true, segments)
+        end, context)
+    end
+    local resolution = context.anime_resolution
+    if resolution then resolved(resolution.ok, resolution.identity, resolution.err)
+    else Anime.resolve(media_info, context, resolved) end
+end
+
 local provider_fns = {
+    aniskip   = query_aniskip,
     theintrodb = query_theintrodb,
     introdb    = query_introdb,
     skipdb     = query_skipdb,
@@ -2357,9 +2778,32 @@ local function merge_segment_lists(primary, secondary)
         primary_types[s.type] = true
     end
     for _, s in ipairs(secondary) do
-        if not primary_types[s.type] then
-            table.insert(result, s)
-            log_info("Merged missing '%s' segment from %s into final segments list", s.label, s.provider)
+        local overlap = false
+        local trimmed_start = s.start_sec
+        for _, p in ipairs(primary) do
+            if (s.provider == 'AniSkip' or p.provider == 'AniSkip')
+                and s.start_sec < p.end_sec and s.end_sec > p.start_sec then
+                local tail = s.type == 'preview' or s.type == 'post_credits'
+                if tail and p.type == 'outro' and s.start_sec >= p.start_sec and s.end_sec > p.end_sec
+                    and p.end_sec - s.start_sec <= SEGMENT_BOUNDARY_TOLERANCE then
+                    trimmed_start = math.max(trimmed_start, p.end_sec)
+                else
+                    overlap = true
+                    break
+                end
+            end
+        end
+        if not primary_types[s.type] and not overlap then
+            if trimmed_start == s.start_sec or s.end_sec - trimmed_start >= user_opts.min_segment_duration then
+                local segment = s
+                if trimmed_start ~= s.start_sec then
+                    segment = copy_table(s)
+                    segment.start_sec = trimmed_start
+                    log_info('Trimmed %s boundary overlap from %.2fs to %.2fs (%s)', s.label, s.start_sec, trimmed_start, s.provider)
+                end
+                table.insert(result, segment)
+                log_info("Merged missing '%s' segment from %s into final segments list", s.label, s.provider)
+            end
         end
     end
     table.sort(result, function(a, b) return a.start_sec < b.start_sec end)
@@ -2373,7 +2817,7 @@ local function fill_outro_end_gap(segments, duration)
     for index, seg in ipairs(segments) do
         local end_sec = tonumber(seg.end_sec)
         local gap = end_sec and (duration - end_sec) or 0
-        if seg.type == 'outro' and gap > 0 and gap <= max_gap then
+        if seg.type == 'outro' and seg.provider ~= 'AniSkip' and gap > 0 and gap <= max_gap then
             local occupied = false
             for _, other in ipairs(segments) do
                 if other ~= seg and other.start_sec < duration and other.end_sec > end_sec then
@@ -2627,8 +3071,19 @@ end
 
 local function filter_provider_segments(segs, context)
     local filtered = {}
+    local duration = context and context.duration
     for _, seg in ipairs(segs) do
-        if provider_segment_allowed(seg.provider, seg.type, context) then
+        local valid = type(seg) == 'table' and finite_number(seg.start_sec) and finite_number(seg.end_sec)
+            and seg.start_sec >= 0 and seg.end_sec > seg.start_sec
+        local end_sec = valid and bounded_segment_end(seg.type, seg.provider, seg.start_sec, seg.end_sec, duration)
+        valid = valid and end_sec ~= nil
+        if not valid then
+            log_request(context, 'debug', 'Dropping invalid or out-of-file cached/provider range')
+        elseif provider_segment_allowed(seg.provider, seg.type, context) then
+            if end_sec ~= seg.end_sec then
+                seg = copy_table(seg)
+                seg.end_sec = end_sec
+            end
             table.insert(filtered, seg)
         else
             log_request(context, 'info', 'Dropping %s segment from %s (disabled via %s_%s_segment=no)',
@@ -2639,18 +3094,17 @@ local function filter_provider_segments(segs, context)
     return filtered
 end
 
-local function get_provider_priority(media_info, configured_only)
+local function provider_media_type(media_info)
+    if user_opts.provider_priority_anime:match('%S') and media_info.anime then return 'anime' end
+    return media_info.is_tv and 'tvshow' or 'movie'
+end
 
-    local priority_str
-    if media_info.is_tv then
-        priority_str = user_opts.provider_priority_tvshow
-    else
-        priority_str = user_opts.provider_priority_movie
-    end
+local function get_provider_priority(media_info, configured_only)
+    local media_type = provider_media_type(media_info)
+    local priority_str = user_opts['provider_priority_' .. media_type]
 
     local providers = parse_provider_priority(priority_str)
     if configured_only then return providers end
-    local media_type = media_info.is_tv and 'tvshow' or 'movie'
     local selected = runtime_overrides.providers[media_type]
     if selected then
         for _, name in ipairs(providers) do
@@ -2673,7 +3127,9 @@ end
 function playlist_prefetch.signature(info)
     local values = {}
     for _, field in ipairs({'title', 'title_with_year', 'year', 'year_ambiguous',
-        'is_tv', 'season', 'episode', 'season_missing', 'imdb_id', 'tmdb_id', 'tvdb_id'}) do
+        'is_tv', 'season', 'episode', 'season_missing', 'imdb_id', 'tmdb_id', 'tvdb_id',
+        'mal_id', 'anilist_id', 'mal_episode', 'episode_numbering', 'source_season_missing',
+        'general_id_supplied', 'anime_episode_ambiguous'}) do
         values[#values + 1] = tostring(info[field])
     end
     return utils.format_json(values)
@@ -2686,6 +3142,7 @@ function playlist_prefetch.sync_options()
     for _, key in ipairs(keys) do values[#values + 1] = tostring(user_opts[key]) end
     values[#values + 1] = tostring(runtime_overrides.providers.tvshow)
     values[#values + 1] = tostring(runtime_overrides.providers.movie)
+    values[#values + 1] = tostring(runtime_overrides.providers.anime)
     local signature = utils.format_json(values)
     if playlist_prefetch.options ~= signature then
         playlist_prefetch.stop()
@@ -2722,10 +3179,7 @@ local function query_segments_pipeline(job, allow_cached)
         state.segments = {}
     end
     local providers = get_provider_priority(media_info)
-    local media_type = media_info.is_tv and 'tvshow' or 'movie'
-    if not job then
-        mp.commandv('script-message', 'jumpskip-provider-order', media_type, table.concat(providers, ','))
-    end
+    local separate_anime_priority = user_opts.provider_priority_anime:match('%S') ~= nil
 
     local finished, id_resolved = false, false
     local function finish(results)
@@ -2733,7 +3187,8 @@ local function query_segments_pipeline(job, allow_cached)
         finished = true
         if user_opts.playlist_prefetch and key then
             playlist_prefetch.cache[key] = {path_key=path_key, signature=signature, media_info=copy_table(media_info),
-                results=copy_table(results), duration=context.duration, id_found=id_resolved}
+                results=copy_table(results), duration=context.duration,
+                id_found=id_resolved or media_info.anime ~= nil, general_resolved=id_resolved}
         end
         if job then
             playlist_prefetch.active = nil
@@ -2762,12 +3217,30 @@ local function query_segments_pipeline(job, allow_cached)
         check_playback_position(mp.get_property_number('time-pos'))
         playlist_prefetch.schedule()
     end
-    if #providers == 0 then finish({}); return end
-    log_request(context, 'info', 'Querying segment timestamps from %d provider(s) [%s]: %s...', #providers, media_type, table.concat(providers, ' -> '))
+    if #providers == 0 and not separate_anime_priority then finish({}); return end
     local function resolved(id_found)
         if not is_current() then return end
         id_resolved = id_found
-        if not id_found then finish({}); return end
+        if separate_anime_priority and not context.anime_resolution then
+            if cached and media_info.anime then
+                context.anime_resolution = {ok=true, identity=media_info.anime}
+            else
+                Anime.resolve(media_info, context, function(ok, identity, err)
+                    if not is_current() then return end
+                    context.anime_resolution = {ok=ok, identity=identity, err=err}
+                    media_info.anime = ok and identity or nil
+                    resolved(id_found)
+                end)
+                return
+            end
+        end
+        providers = get_provider_priority(media_info)
+        local media_type = provider_media_type(media_info)
+        if not job then
+            mp.commandv('script-message', 'jumpskip-provider-order', media_type, table.concat(providers, ','))
+        end
+        if #providers == 0 then finish({}); return end
+        log_request(context, 'info', 'Querying segment timestamps from %d provider(s) [%s]: %s...', #providers, media_type, table.concat(providers, ' -> '))
         local results, pending = {}, #providers
         for idx, name in ipairs(providers) do
             if not is_current() then return end
@@ -2777,7 +3250,7 @@ local function query_segments_pipeline(job, allow_cached)
             local response_duration = context.duration
             local function completed(ok, segs, err)
                 if not is_current() or results[idx] then return end
-                if not ok and result and result.ok then
+                if not ok and result and result.ok and (name ~= 'aniskip' or cached_duration == context.duration) then
                     log_warn('%s refresh failed; using cached segments: %s', name, tostring(err))
                     ok, segs, err = true, copy_table(result.segs), nil
                     response_duration = cached_duration
@@ -2792,15 +3265,17 @@ local function query_segments_pipeline(job, allow_cached)
             if result and result.ok and duration_matches then
                 response_duration = cached_duration
                 completed(true, copy_table(result.segs), nil)
-            elseif query then query(media_info, current_file_id, completed, context)
+            elseif query and (id_found or name == 'aniskip') then query(media_info, current_file_id, completed, context)
+            elseif query then completed(false, nil, 'General media identification failed')
             else completed(false, nil, 'Unknown provider: ' .. name) end
         end
     end
     if cached then
         log_info("Using prefetched metadata for '%s'", media_info.title or '?')
-        resolved(true)
+        resolved(cached.general_resolved ~= false)
     else
-        resolve_title_to_imdb(media_info, current_file_id, resolved, context)
+        if not separate_anime_priority and #providers == 1 and providers[1] == 'aniskip' then resolved(false)
+        else resolve_title_to_imdb(media_info, current_file_id, resolved, context) end
     end
 end
 
@@ -2855,6 +3330,10 @@ local function skip_button_accent(seg)
 end
 
 local function render_skip_button()
+    if state.notification_timer then
+        state.notification_timer:kill()
+        state.notification_timer = nil
+    end
     if not state.button_visible or not state.active_segment then
         if state.overlay then
             state.overlay.data = ""
@@ -2920,6 +3399,7 @@ local function render_skip_button()
 end
 
 local function show_autoskip_notification(label)
+    if state.notification_timer then state.notification_timer:kill() end
     if not state.overlay then
         state.overlay = mp.create_osd_overlay("ass-events")
     end
@@ -2931,7 +3411,6 @@ local function show_autoskip_notification(label)
     local ay       = h - margin_y - math.floor(user_opts.button_height * scale) - math.floor(8 * scale)
     local ax       = w / 2
     local a_accent = string.format("%02X", 255 - math.floor(0.92 * 255))
-    local a_bg     = string.format("%02X", 255 - math.floor(0.85 * 255))
     local ass = string.format(
         "{\\an8}{\\pos(%d,%d)}{\\bord0}{\\shad2}{\\4c&H%s&}{\\1c&H%s&}{\\alpha&H%s&}"
         .. "{\\fn%s}{\\fs%d}{\\b1}Auto-skipped: %s",
@@ -2939,13 +3418,30 @@ local function show_autoskip_notification(label)
         user_opts.bg_color, user_opts.accent_color, a_accent,
         user_opts.button_font, fs, label)
     state.overlay.data = ass
+    state.overlay.res_x, state.overlay.res_y, state.overlay.z = w, h, 2000
     state.overlay:update()
-    mp.add_timeout(user_opts.osd_message_duration, function()
+    local file_id, timer = state.file_id, nil
+    timer = mp.add_timeout(user_opts.osd_message_duration, function()
+        if state.file_id ~= file_id or state.notification_timer ~= timer then return end
+        state.notification_timer = nil
         if state.overlay then
             state.overlay.data = ""
             state.overlay:update()
         end
     end)
+    state.notification_timer = timer
+end
+
+local function set_mbtn_binding(enable)
+    if enable and not state.mbtn_bound then
+        mp.add_forced_key_binding("MBTN_LEFT", "jumpskip_click", perform_skip)
+        state.mbtn_bound = true
+        log_debug("MBTN_LEFT skip binding enabled")
+    elseif not enable and state.mbtn_bound then
+        mp.remove_key_binding("jumpskip_click")
+        state.mbtn_bound = false
+        log_debug("MBTN_LEFT skip binding disabled")
+    end
 end
 
 perform_skip = function(is_auto)
@@ -2957,7 +3453,7 @@ perform_skip = function(is_auto)
 
     local seg    = state.active_segment
     local target = seg.end_sec
-    if not target or target <= 0 then
+    if not finite_number(target) or target <= 0 then
         log_warn("Cannot skip: segment end time unknown")
         return
     end
@@ -2967,14 +3463,6 @@ perform_skip = function(is_auto)
 
     seg.skipped = true
     mp.commandv("seek", target, "absolute", "exact")
-
-    if user_opts.show_osd_message then
-        if is_auto then
-            show_autoskip_notification(seg.label)
-        else
-            mp.osd_message(string.format("Skipped %s", seg.label), user_opts.osd_message_duration)
-        end
-    end
 
     if state.auto_skip_timer then
         state.auto_skip_timer:kill()
@@ -2988,18 +3476,12 @@ perform_skip = function(is_auto)
 
     state.button_visible = false
     state.active_segment = nil
+    state.mouse_hover = false
+    set_mbtn_binding(false)
     render_skip_button()
-end
-
-local function set_mbtn_binding(enable)
-    if enable and not state.mbtn_bound then
-        mp.add_forced_key_binding("MBTN_LEFT", "jumpskip_click", perform_skip)
-        state.mbtn_bound = true
-        log_debug("MBTN_LEFT skip binding enabled")
-    elseif not enable and state.mbtn_bound then
-        mp.remove_key_binding("jumpskip_click")
-        state.mbtn_bound = false
-        log_debug("MBTN_LEFT skip binding disabled")
+    if user_opts.show_osd_message then
+        if is_auto then show_autoskip_notification(seg.label)
+        else mp.osd_message(string.format("Skipped %s", seg.label), user_opts.osd_message_duration) end
     end
 end
 
@@ -3139,6 +3621,7 @@ end
 
 local function reset_state()
     playlist_prefetch.stop()
+    if state.notification_timer then state.notification_timer:kill(); state.notification_timer = nil end
     cancel_requests(state.query_context)
     state.query_context, state.prefetch_ready = nil, false
     state.file_id          = state.file_id + 1
@@ -3212,7 +3695,7 @@ cycle_provider = function()
         mp.osd_message("JumpSkip: load an allowed video to switch providers", user_opts.osd_message_duration)
         return
     end
-    local media_type = state.media_info.is_tv and 'tvshow' or 'movie'
+    local media_type = provider_media_type(state.media_info)
     local providers = get_provider_priority(state.media_info, true)
     if #providers == 0 then
         mp.osd_message("JumpSkip: no providers configured for " .. media_type, user_opts.osd_message_duration)
@@ -3225,7 +3708,7 @@ cycle_provider = function()
     local selected = providers[index + 1]
     runtime_overrides.providers[media_type] = selected
     refresh_current_segments()
-    local labels = {theintrodb="TheIntroDB", introdb="IntroDB", skipdb="SkipDB"}
+    local labels = {theintrodb="TheIntroDB", introdb="IntroDB", skipdb="SkipDB", aniskip="AniSkip"}
     local label = selected and labels[selected] or "Auto (configured priority)"
     if not user_opts.enabled then label = label .. " (script disabled)" end
     mp.osd_message("JumpSkip provider: " .. label, user_opts.osd_message_duration)
@@ -3244,7 +3727,14 @@ local function normalize_absolute_path(path)
         return nil
     end
 
-    local clean = path:gsub("^file://localhost", ""):gsub("^file://", "")
+    if is_url(path) and not path:lower():match('^file://') then
+        local remote_path = path:match('^%a[%w+%.%-]*://[^/?#]*([^?#]*)') or ''
+        return url_decode(remote_path):gsub('\\', '/'):lower()
+    end
+    local clean = path
+    if path:lower():match('^file://') then clean = path:match('^[^?#]*') end
+    clean = clean:gsub("^[Ff][Ii][Ll][Ee]://[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]", "")
+        :gsub("^[Ff][Ii][Ll][Ee]://", "")
     clean = url_decode(clean)
 
     clean = clean:gsub("^/([a-zA-Z]:)", "%1")
@@ -3379,14 +3869,12 @@ function playlist_prefetch.schedule()
         for index, entry in ipairs(entries) do
             local key = playlist_prefetch.key(entry.filename)
             if key then present[key] = true end
-            if index > position then
-                snapshot[#snapshot + 1] = {entry.filename or '', entry.title or ''}
-            end
+            snapshot[#snapshot + 1] = {entry.filename or '', entry.title or ''}
         end
         for key, cached in pairs(playlist_prefetch.cache) do
             if not present[cached.path_key] then playlist_prefetch.cache[key] = nil end
         end
-        local total = #entries - position
+        local total = #entries
         if total <= 1 then return end
         local progress_key = utils.format_json(snapshot)
         if playlist_prefetch.progress_key ~= progress_key then
@@ -3394,7 +3882,8 @@ function playlist_prefetch.schedule()
             log_info('Prefetching playlist: 1/%d', total)
         end
         local context = {quiet=true}
-        for index = position + 2, #entries do
+        for offset = 1, total - 1 do
+            local index = (position + offset) % total + 1
             local entry = entries[index]
             local path = entry.filename
             local key = playlist_prefetch.key(path)
@@ -3403,7 +3892,7 @@ function playlist_prefetch.schedule()
                 local signature = playlist_prefetch.signature(info)
                 local cached = playlist_prefetch.cache[key .. '\0' .. signature]
                 if not cached then
-                    if #get_provider_priority(info) > 0 then
+                    if #get_provider_priority(info) > 0 or user_opts.provider_priority_anime:match('%S') then
                         context.duration = tonumber(entry.duration) or 0
                         playlist_prefetch.active = context
                         query_segments_pipeline({path_key=key, media_info=info, context=context})
@@ -3468,6 +3957,33 @@ mp.register_script_message("reload-config", function()
     runtime_overrides.enabled, runtime_overrides.providers = nil, {}
     load_configuration()
     if state.path then refresh_current_segments() end
+end)
+
+mp.register_script_message('jumpskip-anime-override', function(mal, episode)
+    if not state.media_info then return end
+    if (mal or '') == '' and (episode or '') == '' then
+        state.media_info = extract_media_metadata()
+    else
+        local id, number = integer(mal, 1), tonumber(episode)
+        if not id or not Anime.number(number) or number < 0.5 then
+            mp.osd_message('JumpSkip: supply a MAL ID and episode number', user_opts.osd_message_duration)
+            return
+        end
+        state.media_info.mal_id, state.media_info.mal_episode = id, number
+    end
+    state.media_info.anime = nil
+    refresh_current_segments()
+end)
+
+mp.observe_property('duration', 'number', function(_, duration)
+    if not Anime.number(duration) or duration <= 0 or not state.media_info then return end
+    local previous = state.duration
+    state.duration = duration
+    if previous <= 0 then
+        for _, provider in ipairs(get_provider_priority(state.media_info)) do
+            if provider == 'aniskip' then query_segments_pipeline(); break end
+        end
+    end
 end)
 
 mp.observe_property("time-pos",       "number", function(_, cur_time) check_playback_position(cur_time) end)

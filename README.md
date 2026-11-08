@@ -1,6 +1,6 @@
 # JumpSkip MPV
 
-A powerful, lightweight Lua script for **MPV** that detects and skips media segments (intros, recaps, outros/credits, and previews) using crowdsourced timestamp data from **TheIntroDB**, **IntroDB**, and **SkipDB**.
+A lightweight Lua script for **MPV** that detects and skips media segments (intros, recaps, outros/credits, and previews) using crowdsourced timestamp data from **TheIntroDB**, **IntroDB**, **SkipDB**, and **AniSkip**.
 
 OSC by [ModernZ](https://github.com/Samillion/ModernZ)
 
@@ -41,8 +41,9 @@ All colors are changeable in **`modernz.conf`** or **`uosc.conf`**
   - **TheIntroDB** TV and movies.
   - **IntroDB** TV and movies.
   - **SkipDB** TV and movies.
+  - **AniSkip** Anime. (disabled by default, check .conf)
 - **Intelligent Fallback & Merging**:
-  - Configurable provider priority (`theintrodb,introdb,skipdb` or in any order).
+  - Configurable provider priority (`introdb,theintrodb,skipdb,aniskip` or in any order).
   - Seamless fallback: if the primary provider has no match or encounters a network error, the script automatically queries the next provider.
   - **Segment Merging**: If the primary provider has an intro but lacks an outro or recap, the script queries subsequent providers to fill in missing segment types.
 - **Colored Segments**:
@@ -67,8 +68,8 @@ All colors are changeable in **`modernz.conf`** or **`uosc.conf`**
   - Title-to-ID fallback lookup via Cinemeta or optional TMDb API
   - Reads embedded file metadata tags and parses filenames and folder paths for IMDb IDs.
 - **Playlist Prefetching**:
-  - After the current file is ready, resolves titles and fetches segments for the remaining playlist entries.
-- **Fully Configurable**:
+  - Resolves titles and fetches segments for the whole playlist after the current file is ready.
+  - **Fully Configurable**:
   - Fine-tune timing offsets, segment toggles, provider priorities, timeouts, colors, and button positions via `script-opts/jumpskip.conf`.
 ---
 
@@ -118,7 +119,7 @@ Create or edit `~~/script-opts/jumpskip.conf`:
 ```ini
 # Master toggle for the script
 enabled=yes
-# Prefetch segments for current playlist
+# Playlist prefetching
 playlist_prefetch=yes
 
 # Directory filter (inclusion & exclusion)
@@ -163,23 +164,33 @@ skipdb_submit_enabled=yes
 # Per-media-type provider priority
 provider_priority_tvshow=introdb,theintrodb,skipdb
 provider_priority_movie=introdb,theintrodb,skipdb
+provider_priority_anime=aniskip,introdb,theintrodb,skipdb
+
 # Per-provider, per-segment-type toggles
-#TheIntroDB
+# TheIntroDB
 theintrodb_intro_segment=yes
 theintrodb_recap_segment=yes
 theintrodb_outro_segment=yes
 theintrodb_preview_segment=yes
-#IntroDB
+# IntroDB
 introdb_intro_segment=yes
 introdb_recap_segment=yes
 introdb_outro_segment=yes
 introdb_preview_segment=yes
 introdb_post_credits_segment=yes
-#SkipDB
+# SkipDB
 skipdb_intro_segment=yes
 skipdb_recap_segment=yes
 skipdb_outro_segment=yes
 skipdb_preview_segment=yes
+# AniSkip
+aniskip_intro_segment=yes
+aniskip_outro_segment=yes
+aniskip_recap_segment=yes
+
+# Anime numbering
+anime_episode_numbering=tvdb
+aniskip_duration_tolerance=15
 
 # Timing offsets (in seconds):
 start_offset=0.0
@@ -271,7 +282,7 @@ debug_mode=no
 - [x] Add Colored segments support to other osc.
   - [x] uosc
 - [x] Add ani-cli support.
-- [ ] Add AniSkip.
+- [x] Add AniSkip.
 
 ## Changelog
 
