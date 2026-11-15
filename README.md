@@ -1,6 +1,6 @@
 # JumpSkip MPV
 
-A lightweight Lua script for **MPV** that detects and skips media segments (intros, recaps, outros/credits, and previews) using crowdsourced timestamp data from **TheIntroDB**, **IntroDB**, **SkipDB**, and **AniSkip**.
+A lightweight Lua script for **MPV** that detects and skips media segments (intros, recaps, outros/credits, and previews) using chapter titles and crowdsourced timestamp data from **TheIntroDB**, **IntroDB**, **SkipDB**, and **AniSkip**.
 
 OSC by [ModernZ](https://github.com/Samillion/ModernZ)
 
@@ -78,6 +78,7 @@ All colors are changeable in **`modernz.conf`** or **`uosc.conf`**
 1. **TMDB API** — used first, if a key is configured (Recommended)
 
 - If `tmdb_api_key` is set in user options, it searches `api.themoviedb.org/3/search/movie` or `/search/tv` by parsed title (+ year for movies).
+- Matches the displayed and original titles, and checks TMDb alternative titles when needed for translated or romanized names.
 - On a hit, it stores the **TMDB ID**, then makes a second call to `/external_ids` to resolve an **IMDb ID**.
 
 2. **Cinemeta** — fallback when no TMDb key

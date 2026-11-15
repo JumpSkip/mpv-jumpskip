@@ -413,6 +413,7 @@ local RELEASE_PATTERNS = {
     'blu[ ._-]*ray', '[bd]drip', 'brrip', 'web[ ._-]*dl', 'web[ ._-]*rip',
     'hdtv', 'pdtv', 'dvdrip', 'remux', 'dts', 'truehd', 'atmos', 'eac3',
     'ac3', 'aac', 'flac', 'ddp%d', 'dd%+%d',
+    'dual[ ._-]+audio', 'multi[ ._-]*audio',
 }
 
 local function release_start(s)
@@ -449,7 +450,14 @@ local function prepare_title(raw)
         end)
     end
     local cut = release_start(s)
-    if cut then s = s:sub(1, cut - 1):gsub('[%s%._%-%[%({]+$', '') end
+    if cut then
+        for _, pattern in ipairs({'%b[]', '%b()'}) do
+            for a, b in s:gmatch('()' .. pattern .. '()') do
+                if a < cut and cut < b then cut = a; break end
+            end
+        end
+        s = s:sub(1, cut - 1):gsub('[%s%._%-%[%({]+$', '')
+    end
     for _, edition in ipairs({'extended', 'unrated', 'uncut', 'remastered', 'proper', 'repack', 'directors[ ._-]+cut'}) do
         local pos = s:lower():find('%f[%w]' .. edition .. '%f[%W]')
         if pos and s:sub(1, pos - 1):match('%d%d%d%d[%s._%-%]%)]*$') then s = s:sub(1, pos - 1); break end
@@ -501,6 +509,11 @@ local function parse_title_year(raw)
     return clean, nil, clean, false
 end
 
+local function valid_bare_episode(value)
+    local n = tonumber(value)
+    return n and n > 0 and n <= 2000 and (n < 1888 or n > TitleParser.max_release_year())
+end
+
 function TitleParser.parse_season_episode(str)
     if not str or #str == 0 then return nil, nil, nil, false end
     str = prepare_title(str)
@@ -510,10 +523,31 @@ function TitleParser.parse_season_episode(str)
     for _, pat in ipairs({
         '%f[%w]s(%d%d?)' .. sep .. 'e[p]?' .. sep .. '(%d+)',
         '%f[%w](%d%d?)x(%d+)',
-        '%f[%w]season' .. sep .. '(%d%d?)' .. sep .. 'episode' .. sep .. '(%d+)',
     }) do
         a, b, season, episode = low:find(pat)
         if a then break end
+    end
+    if not a then
+        local season_patterns = {
+            '%f[%w]season' .. sep .. '(%d%d?)',
+            '%f[%w](%d%d?)st' .. sep .. 'season',
+            '%f[%w](%d%d?)nd' .. sep .. 'season',
+            '%f[%w](%d%d?)rd' .. sep .. 'season',
+            '%f[%w](%d%d?)th' .. sep .. 'season',
+            '%f[%w]s(%d%d?)',
+        }
+        for _, season_pattern in ipairs(season_patterns) do
+            for _, marker in ipairs({'episode', 'ep', 'e', ''}) do
+                local ep_pattern = marker == '' and '[%s%._%-%[%]():]+(%d+)'
+                    or sep .. marker .. sep .. '(%d+)'
+                local start, finish, sn, ep = low:find(season_pattern .. ep_pattern)
+                if start and (marker ~= '' or valid_bare_episode(ep)) then
+                    a, b, season, episode = start, finish, sn, ep
+                    break
+                end
+            end
+            if a then break end
+        end
     end
     local missing = false
     if not a then
@@ -526,8 +560,7 @@ function TitleParser.parse_season_episode(str)
         a, b, episode = low:find('[%s_]+%-[%s_]+(%d+)')
         if not a then a, b, episode = low:find('[%s._]+(0%d%d?)v?%d*$') end
         if a then
-            local n = tonumber(episode)
-            if n == 0 or n > 2000 or (n >= 1888 and n <= TitleParser.max_release_year()) then a = nil end
+            if not valid_bare_episode(episode) then a = nil end
             season, missing = '1', true
         end
     end
@@ -539,11 +572,6 @@ function TitleParser.parse_season_episode(str)
     if tail:match('^[%w]') and not tail:match('^e%d+') then return nil, nil, nil, false end
     if tonumber(episode) > 9999 then return nil, nil, nil, false end
     local prefix = str:sub(1, a - 1):gsub('[%s%._%-%[(:]+$', '')
-    if missing then
-        local title, sn = prefix:lower():match('^(.-)%s+season%s*(%d%d?)$')
-        if not title then title, sn = prefix:lower():match('^(.-)[%s._]+s(%d%d?)$') end
-        if title then prefix, season, missing = prefix:sub(1, #title), sn, false end
-    end
     local title, year, title_with_year = parse_title_year(prefix)
     return title, tonumber(season), tonumber(episode), missing, year, title_with_year, episode_ambiguous
 end
@@ -611,8 +639,28 @@ local function candidate_release_year(candidate)
     return tonumber(candidate.name:match('%((%d%d%d%d)%)%s*$'))
 end
 
+local function score_candidate_titles(scorer, candidate, query_title, target_year, all_candidates)
+    local entry = {}
+    for key, value in pairs(candidate) do
+        if key ~= 'aliases' then entry[key] = value end
+    end
+    entry.year = candidate_release_year(candidate)
+    local best = scorer(entry, query_title, target_year, all_candidates)
+    if TitleParser.contains_special(candidate.name) and not TitleParser.contains_special(query_title) then return best end
+    for _, alias in ipairs(candidate.aliases) do
+        if type(alias) == 'string' and has_title(alias) then
+            entry.name = alias
+            best = math.max(best, scorer(entry, query_title, target_year, all_candidates))
+        end
+    end
+    return best
+end
+
 function TitleParser.score_movie_candidate(candidate, query_title, target_year, all_candidates)
     if type(candidate) ~= 'table' or type(candidate.name) ~= 'string' then return -99999 end
+    if type(candidate.aliases) == 'table' then
+        return score_candidate_titles(TitleParser.score_movie_candidate, candidate, query_title, target_year, all_candidates)
+    end
 
     local cand_name = candidate.name
     local cand_year = candidate_release_year(candidate)
@@ -728,6 +776,9 @@ end
 
 function TitleParser.score_series_candidate(candidate, query_title, target_year_or_candidates, all_candidates)
     if type(candidate) ~= 'table' or type(candidate.name) ~= 'string' then return -99999 end
+    if type(candidate.aliases) == 'table' then
+        return score_candidate_titles(TitleParser.score_series_candidate, candidate, query_title, target_year_or_candidates, all_candidates)
+    end
 
     local target_year = nil
     if type(target_year_or_candidates) == "number" then
@@ -747,10 +798,19 @@ function TitleParser.score_series_candidate(candidate, query_title, target_year_
     local c_clean = strip_articles(c_canon)
 
     local cand_year = candidate_release_year(candidate)
+    local q_compact, c_compact = q_clean:gsub(' ', ''), c_clean:gsub(' ', '')
+    local main_name = candidate.name:gsub('–', '-'):gsub('—', '-'):match('^(.-)%s+%-%s*%S')
+    local main_compact = main_name and strip_articles(TitleParser.canonical_title(main_name)):gsub(' ', '')
+    local compatible_special = not TitleParser.contains_special(candidate.name)
+        or TitleParser.contains_special(query_title)
 
     local score = 0
     if q_canon == c_canon or q_clean == c_clean then
         score = 1000
+    elseif compatible_special and q_compact == c_compact then
+        score = 950
+    elseif compatible_special and q_compact == main_compact then
+        score = 400
     else
         local q_words = {}
         for w in q_clean:gmatch("%S+") do q_words[w] = true end
@@ -1328,8 +1388,9 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback, cont
         callback(false)
         return
     end
-    local function pick_best(candidates, query, year)
+    local function pick_best(candidates, query, year, ranked_search)
         local best, best_score = nil, 0
+        local ranked_match
         for rank, candidate in ipairs(candidates) do
             local score
             if media_info.is_tv then score = TitleParser.score_series_candidate(candidate, query, year, candidates)
@@ -1337,8 +1398,37 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback, cont
             score = score - (rank - 1) * 0.5
             log_request(context, 'debug', "Title candidate #%d '%s' score=%.1f", rank, type(candidate) == 'table' and candidate.name or '', score)
             if score > best_score then best, best_score = candidate, score end
+            if ranked_search and not ranked_match and type(candidate) == 'table'
+                and candidate.type == (media_info.is_tv and 'series' or 'movie')
+                and type(candidate.name) == 'string' and has_title(candidate.name)
+                and imdb_id(candidate.imdb_id or candidate.id) then
+                local candidate_year = candidate_release_year(candidate)
+                local wrong_year = year and candidate_year
+                    and math.abs(year - candidate_year) > (media_info.is_tv and 0 or 1)
+                local wrong_edition = TitleParser.contains_special(candidate.name) and not TitleParser.contains_special(query)
+                local q_sequel = TitleParser.canonical_sequel(TitleParser.canonical_title(query))
+                local c_sequel = TitleParser.canonical_sequel(TitleParser.canonical_title(candidate.name))
+                local wrong_sequel = false
+                for _, pair in ipairs({{q_sequel, c_sequel}, {c_sequel, q_sequel}}) do
+                    for number in pair[1]:gmatch('%f[%w](%d+)%f[%W]') do
+                        local value = tonumber(number)
+                        if value > 1 and value < 1900 and not pair[2]:find('%f[%w]' .. number .. '%f[%W]') then
+                            wrong_sequel = true
+                        end
+                    end
+                end
+                if not media_info.is_tv and not TitleParser.contains_special(query) then
+                    for _, genre in ipairs(type(candidate.genres) == 'table' and candidate.genres or {}) do
+                        if type(genre) == 'string' and (genre:lower() == 'documentary' or genre:lower() == 'short') then
+                            wrong_edition = true
+                        end
+                    end
+                end
+                if not wrong_year and not wrong_edition and not wrong_sequel then ranked_match = candidate end
+            end
         end
         if best_score >= 300 then return best, best_score end
+        if ranked_match then return ranked_match, 300, true end
     end
     local queries = {{title=media_info.title, year=media_info.year}}
     if media_info.title_with_year and media_info.title_with_year ~= media_info.title then
@@ -1355,14 +1445,15 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback, cont
         local url = string.format('https://v3-cinemeta.strem.io/catalog/%s/top/search=%s.json', kind, url_encode(query.title))
         request(url, function(ok, data)
             local candidates = ok and data and type(data.metas) == 'table' and data.metas or {}
-            local best, score = pick_best(candidates, query.title, query.year)
+            local best, score, ranked = pick_best(candidates, query.title, query.year, true)
             local id = best and imdb_id(best.imdb_id or best.id)
             if not id then search_cinemeta(index + 1); return end
             validate_cinemeta_season(id, function(valid)
                 if not valid then callback(false); return end
                 media_info.imdb_id = id
                 accept_query(query)
-                log_request(context, 'info', "Resolved '%s' to IMDb ID %s via Cinemeta (score=%.1f)", media_info.title, id, score)
+                log_request(context, 'info', "Resolved '%s' to IMDb ID %s via Cinemeta%s (score=%.1f)", media_info.title, id,
+                    ranked and ' ranked search' or '', score)
                 callback(true)
             end)
         end)
@@ -1418,14 +1509,46 @@ local function resolve_title_to_imdb(media_info, current_file_id, callback, cont
             for _, result in ipairs(ok and data and type(data.results) == 'table' and data.results or {}) do
                 if type(result) == 'table' and integer(result.id, 1) then
                     local date = tostring(result.release_date or result.first_air_date or '')
+                    local original_name = result[media_info.is_tv and 'original_name' or 'original_title']
                     candidates[#candidates + 1] = {id=result.id, name=result.title or result.name,
-                        year=tonumber(date:match('^(%d%d%d%d)'))}
+                        year=tonumber(date:match('^(%d%d%d%d)')),
+                        aliases=type(original_name) == 'string' and {original_name} or nil}
                 end
             end
             local best = pick_best(candidates, query.title, query.year)
-            if best then on_tmdb_match(best.id, query)
-            elseif query.year and not no_year then search_tmdb(index, true)
-            else search_tmdb(index + 1) end
+            if best then on_tmdb_match(best.id, query); return end
+            local function finish_alternatives()
+                local match = pick_best(candidates, query.title, query.year)
+                if match then on_tmdb_match(match.id, query)
+                elseif query.year and not no_year then search_tmdb(index, true)
+                else search_tmdb(index + 1) end
+            end
+            local function fetch_alternatives(rank, count)
+                local candidate = candidates[rank]
+                if not candidate or count >= 5 then finish_alternatives(); return end
+                if type(candidate.name) ~= 'string' then fetch_alternatives(rank + 1, count); return end
+                local wrong_year = query.year and candidate.year
+                    and math.abs(query.year - candidate.year) > (media_info.is_tv and 0 or 1)
+                local wrong_edition = TitleParser.contains_special(candidate.name)
+                    and not TitleParser.contains_special(query.title)
+                if wrong_year or wrong_edition then
+                    fetch_alternatives(rank + 1, count); return
+                end
+                local alias_url = string.format('https://api.themoviedb.org/3/%s/%d/alternative_titles?api_key=%s', kind, candidate.id, api_key)
+                request(alias_url, function(alias_ok, aliases)
+                    local titles = alias_ok and aliases and aliases[media_info.is_tv and 'results' or 'titles']
+                    if type(titles) == 'table' then
+                        candidate.aliases = candidate.aliases or {}
+                        for _, item in ipairs(titles) do
+                            if type(item) == 'table' and type(item.title) == 'string' then
+                                candidate.aliases[#candidate.aliases + 1] = item.title
+                            end
+                        end
+                    end
+                    fetch_alternatives(rank + 1, count + 1)
+                end)
+            end
+            fetch_alternatives(1, 0)
         end)
     end
     search_tmdb()
