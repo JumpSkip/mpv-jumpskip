@@ -1,6 +1,6 @@
 --[[
     mpv-skip-segment
-    version 2.4
+    version 2.5
     ================
     A Lua script for mpv that detects and skips segments (intros, recaps, outros/credits, previews,
     and movie end-credits/post-credits) using crowdsourced data from TheIntroDB (api.theintrodb.org),
@@ -29,7 +29,7 @@ local options = require 'mp.options'
 
 local user_opts = {
     enabled              = true,
-    playlist_prefetch    = true,
+    playlist_prefetch    = false,
     auto_skip            = false,
     auto_skip_countdown  = 0,
     autoskip_types       = "",
@@ -265,7 +265,9 @@ local function validate_options()
     end
 end
 
-local function load_configuration()
+local configuration_loaded = false
+local function load_configuration(use_cached)
+    if use_cached and configuration_loaded then return end
     for key, value in pairs(default_opts) do user_opts[key] = value end
 
     local script_dir = debug.getinfo(1, 'S').source:match("@?(.*[/\\])")
@@ -316,6 +318,7 @@ local function load_configuration()
     update_keybind()
     update_submission_keybind()
     update_runtime_keybinds()
+    configuration_loaded = true
     log_info("Configuration active (keybind: %s, auto_skip: %s, tv_priority: %s, movie_priority: %s, anime_priority: %s)%s",
         tostring(user_opts.keybind), tostring(user_opts.auto_skip),
         tostring(user_opts.provider_priority_tvshow), tostring(user_opts.provider_priority_movie),
@@ -1287,11 +1290,17 @@ local function async_http_request(method, url, headers, data, timeout_sec, callb
         json_data, err = utils.format_json(data)
         if not json_data then callback(false, nil, 'JSON encoding failed: ' .. tostring(err), 0); return end
     end
-    local body_file = os.tmpname()
+    local created, body_file = pcall(os.tmpname)
+    if not created or not body_file then
+        callback(false, nil, 'Could not create HTTP response file', 0)
+        return
+    end
+    local body_limit = 32 * 1024 * 1024
     local args = {
         'curl', '-s', '-S', '--max-time', tostring(timeout_sec or user_opts.request_timeout),
         '--connect-timeout', '4', '-H', 'User-Agent: mpv-skip-segment/1.0',
         '-H', 'Accept: application/json', '-w', '%{http_code}', '-o', body_file,
+        '--max-filesize', tostring(body_limit),
     }
     if method == 'POST' then
         for _, arg in ipairs({'-H', 'Content-Type: application/json', '-X', 'POST', '--data-binary', json_data}) do
@@ -1310,15 +1319,28 @@ local function async_http_request(method, url, headers, data, timeout_sec, callb
         completed_once = true
         if context and request_id then context.requests[request_id] = nil end
         local code = tonumber(res and res.stdout and res.stdout:match('(%d%d%d)%s*$')) or 0
+        if context and context.cancelled then
+            os.remove(body_file)
+            return
+        end
         local body = ''
         local f = io.open(body_file, 'rb')
-        if f then body = f:read('*a') or ''; f:close() end
+        local read_ok = true
+        if f then
+            read_ok, body = pcall(f.read, f, body_limit + 1)
+            f:close()
+            body = read_ok and body or ''
+        end
         os.remove(body_file)
-        if context and context.cancelled then return end
+        body = body or ''
         if not success or not res or res.status ~= 0 then
             local message = res and ('curl error (exit code ' .. tostring(res.status) .. '): ' .. (res.stderr or ''))
                 or err or 'curl execution failed'
             callback(false, nil, redact_http_secrets(message), code)
+            return
+        end
+        if not read_ok or #body > body_limit then
+            callback(false, nil, not read_ok and 'Could not read HTTP response' or 'HTTP response exceeded size limit', code)
             return
         end
         local parsed, parse_err = utils.parse_json(body)
@@ -1333,15 +1355,19 @@ local function async_http_request(method, url, headers, data, timeout_sec, callb
             callback(true, parsed, nil, code)
         end
     end
-    local ok, launched_id = pcall(mp.command_native_async, {
+    local ok, launched_id, launch_error = pcall(mp.command_native_async, {
         name='subprocess', args=args, capture_stdout=true, capture_stderr=true, playback_only=false,
+        capture_size=64 * 1024,
     }, completed)
     request_id = launched_id
-    if not ok then
+    if not ok or not request_id then
         os.remove(body_file)
-        if completed_once then error(request_id) end
-        completed_once = true
-        callback(false, nil, redact_http_secrets(request_id), 0)
+        if completed_once then
+            if not ok then error(request_id) end
+        else
+            completed_once = true
+            callback(false, nil, redact_http_secrets(ok and launch_error or request_id), 0)
+        end
     elseif context and not completed_once then
         context.requests = context.requests or {}
         context.requests[request_id] = true
@@ -3142,6 +3168,28 @@ local function build_marked_chapters(base_chapters, segments, duration, default_
     return deduped, #active_segs
 end
 
+local function same_entries(first, second, fields)
+    if type(first) ~= 'table' or type(second) ~= 'table' or #first ~= #second then return false end
+    for index, entry in ipairs(first) do
+        if type(entry) ~= 'table' or type(second[index]) ~= 'table' then return false end
+        for _, field in ipairs(fields) do
+            if entry[field] ~= second[index][field] then return false end
+        end
+    end
+    return true
+end
+
+local function publish_marker_ranges(published, force)
+    local current = mp.get_property_native('user-data/jumpskip/segments')
+    if not force and same_entries(current, published, {'start', 'end', 'kind'}) then
+        return
+    end
+    local ok, result, err = pcall(mp.set_property_native, 'user-data/jumpskip/segments', published)
+    if not ok or result == false or err ~= nil then
+        log_debug('Could not publish seekbar highlights (user-data may be unavailable)')
+    end
+end
+
 local function publish_segments(segments)
     local published = {}
     for _, seg in ipairs(segments) do
@@ -3153,10 +3201,7 @@ local function publish_segments(segments)
             })
         end
     end
-    local ok = pcall(mp.set_property_native, "user-data/jumpskip/segments", published)
-    if not ok then
-        log_debug("user-data properties unavailable (mpv < 0.36); seekbar highlights disabled")
-    end
+    publish_marker_ranges(published)
     if user_opts.mark_chapters then
 
         if state.base_chapter_list == nil then
@@ -3175,9 +3220,12 @@ local function publish_segments(segments)
             user_opts.default_chapter_title
         )
 
-        mp.set_property_native("chapter-list", chapters)
-        log_debug("Updated chapter markers (%d segment(s) marked, %d total chapters in chapter-list)",
-            marked_count, #chapters)
+        local current = mp.get_property_native('chapter-list') or {}
+        if not same_entries(current, chapters, {'time', 'title'}) then
+            mp.set_property_native("chapter-list", chapters)
+            log_debug("Updated chapter markers (%d segment(s) marked, %d total chapters in chapter-list)",
+                marked_count, #chapters)
+        end
     end
 end
 
@@ -3240,9 +3288,8 @@ end
 
 function playlist_prefetch.key(path)
     if not path or path == '' then return nil end
-    if not is_url(path) then
-        local ok, normalized = pcall(mp.command_native, {'normalize-path', path})
-        if ok and type(normalized) == 'string' then return normalized end
+    if not is_url(path) and not path:match('^[\\/]') and not path:match('^%a:') then
+        path = utils.join_path(mp.get_property('working-directory') or '', path)
     end
     return path
 end
@@ -3742,7 +3789,7 @@ local function on_mouse_pos(_, mouse)
     end
 end
 
-local function reset_state()
+local function reset_state(force_markers)
     playlist_prefetch.stop()
     if state.notification_timer then state.notification_timer:kill(); state.notification_timer = nil end
     cancel_requests(state.query_context)
@@ -3788,17 +3835,18 @@ local function reset_state()
         state.overlay.data = ""
         state.overlay:update()
     end
-    pcall(mp.set_property_native, "user-data/jumpskip/segments", {})
+    publish_marker_ranges({}, force_markers)
 end
 
 local function refresh_current_segments()
     playlist_prefetch.cache = {}
     local path, filename = state.path, state.filename
     local duration, media_info = state.duration, state.media_info
-    if state.base_chapter_list ~= nil then
+    if state.base_chapter_list ~= nil and not same_entries(
+        mp.get_property_native('chapter-list') or {}, state.base_chapter_list, {'time', 'title'}) then
         mp.set_property_native("chapter-list", state.base_chapter_list)
     end
-    reset_state()
+    reset_state(true)
     state.path, state.filename = path, filename
     state.duration, state.media_info = duration, media_info
     query_segments_pipeline()
@@ -3982,7 +4030,7 @@ end
 function playlist_prefetch.schedule()
     if not user_opts.enabled or not user_opts.playlist_prefetch or not state.prefetch_ready
         or state.query_in_progress or playlist_prefetch.active or playlist_prefetch.timer then return end
-    playlist_prefetch.timer = mp.add_timeout(0.1, function()
+        playlist_prefetch.timer = mp.add_timeout(1.0, function()
         playlist_prefetch.timer = nil
         playlist_prefetch.sync_options()
         local entries = mp.get_property_native('playlist') or {}
@@ -4037,7 +4085,7 @@ local function on_playlist_changed()
 end
 
 local function on_file_loaded()
-    load_configuration()
+    load_configuration(true)
     reset_state()
     state.path     = mp.get_property("path")
     state.filename = mp.get_property("filename")

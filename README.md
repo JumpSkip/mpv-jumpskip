@@ -121,7 +121,7 @@ Create or edit `~~/script-opts/jumpskip.conf`:
 # Master toggle for the script
 enabled=yes
 # Playlist prefetching
-playlist_prefetch=yes
+playlist_prefetch=no
 
 # Directory filter (inclusion & exclusion)
 filter_directories=
